@@ -3238,9 +3238,16 @@ class CorrectionPreviewDialog(QDialog):
 
     def _populate_table(self):
         self._suppress_table_item_changes = True
-        self.table.setRowCount(0)
-        current_data = self._get_current_view_data()
-        self.table.setRowCount(len(current_data))
+        previous_navigation_suppressed = self._suppress_table_navigation
+        self._suppress_table_navigation = True
+        table_signal_blocker = QtCore.QSignalBlocker(self.table)
+        try:
+            self.table.setRowCount(0)
+            current_data = self._get_current_view_data()
+            self.table.setRowCount(len(current_data))
+        finally:
+            del table_signal_blocker
+            self._suppress_table_navigation = previous_navigation_suppressed
 
         resolution_color = QColor(255, 193, 7, 50) 
         hidden_color = QColor(108, 117, 125, 40)
@@ -3478,6 +3485,5 @@ class CorrectionPreviewDialog(QDialog):
         self._auto_scroll_timer.stop()
         self._flush_review_preferences()
         super().reject()
-
 
 
