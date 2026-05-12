@@ -1,8 +1,10 @@
 import threading
 import asyncio
 import aiohttp
+import os
 import re
 import contextvars
+import ssl
 import time
 import sys
 from collections import Counter
@@ -33,6 +35,27 @@ except (ImportError, AttributeError):
     ProxyConnector = None
     ProxyType = None
     PROXY_ERRORS = ()
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
+
+
+def _create_ssl_context():
+    """Create a reliable SSL context for aiohttp across python.org/macOS builds."""
+    cafile = os.environ.get("SSL_CERT_FILE") or None
+    capath = os.environ.get("SSL_CERT_DIR") or None
+    if cafile or capath:
+        return ssl.create_default_context(cafile=cafile, capath=capath)
+
+    if certifi is not None:
+        try:
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception as exc:
+            print(f"[API WARN] Не удалось загрузить certifi CA bundle: {exc}")
+
+    return ssl.create_default_context()
 
 def get_worker_loop():
     """Получает или создает event loop для текущего потока воркера."""
@@ -100,6 +123,7 @@ class BaseApiHandler:
             if hasattr(_thread_local, "session_timeout"):
                 delattr(_thread_local, "session_timeout")
         
+        ssl_context = _create_ssl_context()
         connector = None
         if self.proxy_settings and self.proxy_settings.get('enabled'):
             try:
@@ -109,12 +133,17 @@ class BaseApiHandler:
                 user = self.proxy_settings.get('user')
                 pwd = self.proxy_settings.get('pass')
                 
-                if host and port:
+                if host and port and ProxyConnector is not None:
                     auth = f"{user}:{pwd}@" if user and pwd else ""
                     url = f"{p_type}://{auth}{host}:{port}"
-                    connector = ProxyConnector.from_url(url, rdns=True)
+                    connector = ProxyConnector.from_url(url, rdns=True, ssl=ssl_context)
+                elif host and port:
+                    print("[API ERROR] Прокси включен, но aiohttp_socks недоступен.")
             except Exception as e:
                 print(f"[API ERROR] Не удалось создать прокси-коннектор: {e}")
+
+        if connector is None:
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
 
         timeout = aiohttp.ClientTimeout(total=api_timeout)
         _thread_local.session = aiohttp.ClientSession(

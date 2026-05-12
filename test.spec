@@ -32,6 +32,7 @@ if localappdata:
     add_runtime_data(datas, Path(localappdata) / "ms-playwright", "playwright_runtime\\ms-playwright")
 
 datas += collect_data_files("PyQt6")
+datas += collect_data_files("certifi")
 datas += collect_data_files("docx")
 datas += collect_data_files("emoji")
 datas += collect_data_files("jieba")

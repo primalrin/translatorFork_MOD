@@ -3,6 +3,7 @@
 aiohttp
 aiohttp_socks
 beautifulsoup4
+certifi
 curl_cffi
 emoji
 flask

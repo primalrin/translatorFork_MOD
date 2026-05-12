@@ -2,6 +2,7 @@
 aiohttp
 aiohttp_socks
 beautifulsoup4
+certifi
 curl_cffi
 EbookLib
 edge-tts

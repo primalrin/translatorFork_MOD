@@ -3,6 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 
 datas = [('config', 'config'), ('README.md', '.'), ('ffmpeg.exe', '.'), ('ffprobe.exe', '.'), ('gemini_translator\\scripts\\chatgpt_workascii_bridge.cjs', 'gemini_translator\\scripts'), ('gemini_translator\\scripts\\chatgpt_profile_launcher.cjs', 'gemini_translator\\scripts'), ('playwright_runtime\\node.exe', 'playwright_runtime'), ('playwright_runtime\\package', 'playwright_runtime\\package'), ('playwright_runtime\\ms-playwright', 'playwright_runtime\\ms-playwright')]
 datas += collect_data_files('PyQt6')
+datas += collect_data_files('certifi')
 datas += collect_data_files('docx')
 datas += collect_data_files('emoji')
 datas += collect_data_files('jieba')

@@ -52,7 +52,7 @@ DATA_FILE_EXTENSIONS = {'.txt', '.json', '.ico', '.css', '.html', '.js'}
 # RanobeLib загружается из bundled source-файлов, поэтому PyInstaller
 # не видит его import playwright.sync_api во время анализа main.py.
 HIDDEN_IMPORTS_BLOCK = ['PyQt6.sip', 'docx', 'playwright.sync_api', 'google.genai', 'google.genai.types']
-MANUAL_COLLECT_DATA_MODULES = {'docx'}
+MANUAL_COLLECT_DATA_MODULES = {'certifi', 'docx'}
 COLLECT_DATA_EXCLUDE_MODULES = {'setuptools'}
 MANUALLY_PACKAGED_PACKAGES = {'playwright'}
 # --- КОНФИГУРАЦИЯ ЗАВИСИМОСТЕЙ ---

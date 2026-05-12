@@ -24,6 +24,12 @@ class _FakeClientSession:
         self.close_calls += 1
 
 
+class _FakeTCPConnector:
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+
+
 class ProxySessionResetTests(unittest.TestCase):
     def setUp(self):
         self.handler = BaseApiHandler(_WorkerStub())
@@ -38,14 +44,32 @@ class ProxySessionResetTests(unittest.TestCase):
             if hasattr(base_module._thread_local, attr):
                 delattr(base_module._thread_local, attr)
 
-    def test_proxy_change_recreates_cached_session(self):
+    def test_session_uses_explicit_ssl_context_without_proxy(self):
         loop = get_worker_loop()
+        ssl_context = object()
 
         with patch("gemini_translator.api.base.aiohttp.ClientSession", _FakeClientSession), \
+             patch("gemini_translator.api.base.aiohttp.TCPConnector", _FakeTCPConnector), \
+             patch("gemini_translator.api.base._create_ssl_context", return_value=ssl_context, create=True):
+            self.handler.setup_client(proxy_settings={"enabled": False})
+            session = loop.run_until_complete(self.handler._get_or_create_session_internal(600))
+
+        connector = session.kwargs["connector"]
+        self.assertIsInstance(connector, _FakeTCPConnector)
+        self.assertIs(connector.kwargs["ssl"], ssl_context)
+
+    def test_proxy_change_recreates_cached_session(self):
+        loop = get_worker_loop()
+        ssl_context = object()
+
+        with patch("gemini_translator.api.base.aiohttp.ClientSession", _FakeClientSession), \
+             patch("gemini_translator.api.base.aiohttp.TCPConnector", _FakeTCPConnector), \
+             patch("gemini_translator.api.base._create_ssl_context", return_value=ssl_context, create=True), \
              patch("gemini_translator.api.base.ProxyConnector") as proxy_connector:
-            proxy_connector.from_url.side_effect = lambda url, rdns=True: {
+            proxy_connector.from_url.side_effect = lambda url, rdns=True, **kwargs: {
                 "url": url,
                 "rdns": rdns,
+                **kwargs,
             }
 
             self.handler.setup_client(
@@ -66,8 +90,13 @@ class ProxySessionResetTests(unittest.TestCase):
         self.assertIsNot(first_session, second_session)
         self.assertTrue(first_session.closed)
         self.assertEqual(first_session.close_calls, 1)
-        self.assertIsNone(second_session.kwargs["connector"])
-        proxy_connector.from_url.assert_called_once_with("socks5://proxy.example:1080", rdns=True)
+        self.assertIsInstance(second_session.kwargs["connector"], _FakeTCPConnector)
+        self.assertIs(second_session.kwargs["connector"].kwargs["ssl"], ssl_context)
+        proxy_connector.from_url.assert_called_once_with(
+            "socks5://proxy.example:1080",
+            rdns=True,
+            ssl=ssl_context,
+        )
 
 
 if __name__ == "__main__":
