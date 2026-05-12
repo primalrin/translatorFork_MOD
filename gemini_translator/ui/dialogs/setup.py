@@ -3135,6 +3135,25 @@ class InitialSetupDialog(QDialog):
             # Обновляем UI, так как это был прямой вызов от пользователя
             self._on_project_data_changed()
 
+    def _ensure_pending_tasks_for_start(self) -> bool:
+        """
+        Guarantees that the internal task queue matches the selected chapters
+        before start validation runs.
+        """
+        engine = getattr(self, 'engine', None)
+        task_manager = getattr(engine, 'task_manager', None) or getattr(self, 'task_manager', None)
+        if task_manager and task_manager.has_pending_tasks():
+            return True
+
+        if not (self.selected_file and self.output_folder and self.html_files):
+            return False
+
+        print("[INFO] Очередь задач пуста перед стартом. Пересобираю её из выбранных глав…")
+        self._prepare_and_display_tasks(clean_rebuild=True)
+        engine = getattr(self, 'engine', None)
+        task_manager = getattr(engine, 'task_manager', None) or getattr(self, 'task_manager', None)
+        return bool(task_manager and task_manager.has_pending_tasks())
+
 
     def _start_translation(
         self,
@@ -3196,8 +3215,8 @@ class InitialSetupDialog(QDialog):
         if auto_settings.get('enabled') and not is_auto_restart and auto_model_name:
             self._auto_log(f"Модель основного автопрогона: {auto_model_name}.", force=True)
 
-        # 1. Проверяем, существуют ли задачи, заглядывая напрямую в TaskManager
-        tasks_exist = self.engine and self.engine.task_manager and self.engine.task_manager.has_pending_tasks()
+        # 1. Проверяем и при необходимости восстанавливаем очередь задач.
+        tasks_exist = self._ensure_pending_tasks_for_start()
         active_keys_for_start = (
             pending_session_override.get('api_keys')
             if isinstance(pending_session_override, dict) and pending_session_override.get('api_keys')
@@ -3821,9 +3840,25 @@ class InitialSetupDialog(QDialog):
         ТОЛЬКО обновляет UI-лейбл на основе текущих настроек и последней калибровки.
         Версия 2.0: Корректно учитывает количество клиентов (параллельных окон).
         """
+        label = self.model_settings_widget.fuzzy_status_label
+        dynamic_glossary_enabled = self.model_settings_widget.dynamic_glossary_checkbox.isChecked()
+        fuzzy_threshold = self.model_settings_widget.fuzzy_threshold_spin.value()
+
+        if not dynamic_glossary_enabled:
+            label.setText("Fuzzy-поиск: выключен (динамический глоссарий отключен)")
+            label.setToolTip("Динамический глоссарий отключен, поэтому fuzzy-фильтрация не выполняется.")
+            label.setStyleSheet("color: #aaa; font-size: 10px;")
+            return
+
+        if fuzzy_threshold >= 100:
+            label.setText("Fuzzy-поиск: выключен (точный поиск)")
+            label.setToolTip("Порог 100% отключает нечеткий fuzzy-поиск. Используется быстрый точный поиск по глоссарию.")
+            label.setStyleSheet("color: #aaa; font-size: 10px;")
+            return
+
         if self.cpu_performance_index is None or self.cpu_performance_index == 0:
-            self.model_settings_widget.fuzzy_status_label.setText("Fuzzy-поиск: (требуется калибровка 🔄)")
-            self.model_settings_widget.fuzzy_status_label.setStyleSheet("color: #aaa;")
+            label.setText("Fuzzy-поиск: (требуется калибровка 🔄)")
+            label.setStyleSheet("color: #aaa;")
             return
 
         # --- Получаем все необходимые данные ---
@@ -3856,9 +3891,6 @@ class InitialSetupDialog(QDialog):
         total_application_rpm = rpm * num_clients
         interval = 60 / total_application_rpm
         # --- КОНЕЦ КЛЮЧЕВОГО ИСПРАВЛЕНИЯ ---
-
-        # --- Управление UI (теперь с корректными данными) ---
-        label = self.model_settings_widget.fuzzy_status_label
 
         if estimated_time > interval:
             label.setText(f"Fuzzy-поиск: ~{estimated_time:.2f} сек. (Дольше, чем {interval:.2f}с/запрос. 🔴)")
