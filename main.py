@@ -865,12 +865,85 @@ class ApplicationWithContext(QtWidgets.QApplication):
 
 class EventBus(QtCore.QObject):
     import threading
+    class _TopicEmitter(QtCore.QObject):
+        event_posted = QtCore.pyqtSignal(dict)
+
     event_posted = QtCore.pyqtSignal(dict)
     # Новые атрибуты и методы для "шины с инерцией"
     # Сигнал, который передает ключ измененных данных
     data_changed = QtCore.pyqtSignal(str)
     _data_store = {}
     _lock = threading.Lock()
+
+    def __init__(self):
+        super().__init__()
+        self._topic_subscribers = {}
+        self._topic_lock = self.threading.Lock()
+        self.event_posted.connect(self._dispatch_to_topics)
+
+    def subscribe(self, event_name: str, callback):
+        """Подписывает callback только на конкретный тип события."""
+        with self._topic_lock:
+            subscribers = self._topic_subscribers.setdefault(event_name, [])
+            if any(item[0] == callback for item in subscribers):
+                return
+            emitter = self._TopicEmitter(self)
+            emitter.event_posted.connect(callback)
+            subscribers.append((callback, emitter))
+
+    def unsubscribe(self, event_name: str, callback):
+        """Убирает callback из конкретной topic-подписки."""
+        with self._topic_lock:
+            subscribers = self._topic_subscribers.get(event_name)
+            if not subscribers:
+                return
+            remaining = []
+            for subscribed_callback, emitter in subscribers:
+                if subscribed_callback == callback:
+                    try:
+                        emitter.event_posted.disconnect(callback)
+                    except (TypeError, RuntimeError):
+                        pass
+                    emitter.deleteLater()
+                else:
+                    remaining.append((subscribed_callback, emitter))
+            subscribers[:] = remaining
+            if not subscribers:
+                self._topic_subscribers.pop(event_name, None)
+
+    def unsubscribe_all(self, callback):
+        """Убирает callback из всех topic-подписок."""
+        with self._topic_lock:
+            empty_topics = []
+            for event_name, subscribers in self._topic_subscribers.items():
+                remaining = []
+                for subscribed_callback, emitter in subscribers:
+                    if subscribed_callback == callback:
+                        try:
+                            emitter.event_posted.disconnect(callback)
+                        except (TypeError, RuntimeError):
+                            pass
+                        emitter.deleteLater()
+                    else:
+                        remaining.append((subscribed_callback, emitter))
+                subscribers[:] = remaining
+                if not subscribers:
+                    empty_topics.append(event_name)
+            for event_name in empty_topics:
+                self._topic_subscribers.pop(event_name, None)
+
+    def _dispatch_to_topics(self, event: dict):
+        event_name = event.get('event') if isinstance(event, dict) else None
+        if not event_name:
+            return
+        with self._topic_lock:
+            emitters = [emitter for _callback, emitter in self._topic_subscribers.get(event_name, [])]
+        for emitter in emitters:
+            emitter.event_posted.emit(event)
+
+    def emit_event(self, event: dict):
+        """Совместимый способ отправки: topics + старый event_posted сигнал."""
+        self.event_posted.emit(event)
 
     def set_data(self, key: str, value):
         """Потокобезопасно сохраняет данные и испускает сигнал."""

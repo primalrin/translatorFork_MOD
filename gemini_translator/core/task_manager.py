@@ -106,7 +106,10 @@ class ChapterQueueManager(QObject):
             self.bus = app.event_bus
         
         self.session_id = None
-        self.bus.event_posted.connect(self.on_event)
+        if hasattr(self.bus, "subscribe"):
+            self.bus.subscribe("session_finished", self.on_event)
+        else:
+            self.bus.event_posted.connect(self.on_event)
 
         self.master_uri = SHARED_DB_URI
 
@@ -307,7 +310,10 @@ class ChapterQueueManager(QObject):
         event = {
             'event': name, 'source': 'ChapterQueueManager', 'session_id': self.session_id, 'data': data or {}
         }
-        self.bus.event_posted.emit(event)
+        if hasattr(self.bus, "emit_event"):
+            self.bus.emit_event(event)
+        else:
+            self.bus.event_posted.emit(event)
     
     def _handle_session_finished_background(self):
         """
@@ -516,6 +522,11 @@ class ChapterQueueManager(QObject):
                 tasks_to_insert.append((str(task_id), json.dumps(payload, default=tuple_serializer), 'pending', start_seq + i))
             conn.executemany("INSERT OR IGNORE INTO tasks (task_id, payload, status, sequence) VALUES (?, ?, ?, ?)", tasks_to_insert)
         self._safe_request_ui_update()
+        if tasks_to_insert:
+            self._post_event('tasks_added', {
+                'count': len(tasks_to_insert),
+                'reason': 'add_pending_tasks',
+            })
     
     def get_next_task(self, worker_id: str) -> tuple | None:
         task_for_work = self.update_task(task_id=None, worker_id=worker_id, new_status='in_progress')
@@ -1719,6 +1730,11 @@ class ChapterQueueManager(QObject):
         
         # --- ЭТАП 3: Уведомление UI (вне транзакции) ---
         self._safe_request_ui_update()
+        if tasks_to_insert:
+            self._post_event('tasks_added', {
+                'count': len(tasks_to_insert),
+                'reason': 'set_pending_tasks',
+            })
 
     def set_pending_task_chains(self, task_chains: list[list], initial_history: dict = None):
         """
@@ -1783,6 +1799,11 @@ class ChapterQueueManager(QObject):
                 )
 
         self._safe_request_ui_update()
+        if tasks_to_insert:
+            self._post_event('tasks_added', {
+                'count': len(tasks_to_insert),
+                'reason': 'set_pending_task_chains',
+            })
 
 
     def fetch_and_clean_glossary(self, mode: str = 'supplement', cleanup_threshold: float = 0.3, min_count: int = 500, return_raw: bool = False) -> list:

@@ -59,6 +59,7 @@ from .worker_helpers.task_factory import get_task_processor_class
 
 
 _DEBUG_OPERATION_CONTEXT = contextvars.ContextVar("worker_debug_operation_context", default={})
+WORKER_IDLE_WAKE_TIMEOUT_SECONDS = 2.0
 
 # ============================================================================
 #  ЕДИНЫЙ УНИВЕРСАЛЬНЫЙ КЛАСС-ВОРКЕР
@@ -72,7 +73,16 @@ class UniversalWorker(QObject):
         app = QtWidgets.QApplication.instance()
         if not hasattr(app, 'event_bus'): raise RuntimeError("EventBus не найден.")
         self.bus = app.event_bus
-        self.bus.event_posted.connect(self.on_event)
+        self._uses_topic_subscription = False
+        self._worker_loop = None
+        self._wake_event = None
+        self._event_topics = (
+            'stop_session_requested',
+            'graceful_shutdown_requested',
+            'cancel_graceful_shutdown',
+            'tasks_added',
+        )
+        self._connect_to_bus()
         self.session_id = None
         self.worker_id = None
         # Флаги состояния (их инициализируем один раз, но при реините сбрасываем)
@@ -96,7 +106,41 @@ class UniversalWorker(QObject):
             'data': data or {}
         }
         # Просто вызываем emit. Qt сделает все остальное.
-        self.bus.event_posted.emit(event)
+        if hasattr(self.bus, "emit_event"):
+            self.bus.emit_event(event)
+        else:
+            self.bus.event_posted.emit(event)
+
+    def _connect_to_bus(self):
+        if hasattr(self.bus, "subscribe"):
+            for topic in self._event_topics:
+                self.bus.subscribe(topic, self.on_event)
+            self._uses_topic_subscription = True
+        else:
+            self.bus.event_posted.connect(self.on_event)
+
+    def _disconnect_from_bus(self):
+        if not getattr(self, 'bus', None):
+            return
+        try:
+            if getattr(self, '_uses_topic_subscription', False) and hasattr(self.bus, "unsubscribe"):
+                for topic in getattr(self, '_event_topics', ()):
+                    self.bus.unsubscribe(topic, self.on_event)
+            elif hasattr(self.bus, "event_posted"):
+                self.bus.event_posted.disconnect(self.on_event)
+        except (TypeError, RuntimeError, ValueError):
+            pass
+
+    def notify(self):
+        """Будит асинхронный цикл воркера без активного polling."""
+        loop = getattr(self, '_worker_loop', None)
+        wake_event = getattr(self, '_wake_event', None)
+        if loop is None or wake_event is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(wake_event.set)
+        except RuntimeError:
+            pass
 
     @contextlib.contextmanager
     def debug_operation_context(self, operation_context: dict | None = None):
@@ -273,6 +317,7 @@ class UniversalWorker(QObject):
                 if target_worker_id == current_worker_id:
                     self._post_event('log_message', {'message': f"[INFO] …{current_worker_id[-4:]} получил приказ на грациозное завершение."})
                     self.initiate_graceful_shutdown()
+                    self.notify()
             
             # 3. Реакция на персональную команду "оживления"
             if event_name == 'cancel_graceful_shutdown':
@@ -293,6 +338,10 @@ class UniversalWorker(QObject):
                         self.is_shutting_down = False
                         self.is_cancelled = False
                         self._post_event('log_message', {'message': f"✅ Воркер …{current_worker_id[-4:]} 'оживлен'."})
+                    self.notify()
+
+            if event_name == 'tasks_added':
+                self.notify()
 
         except AttributeError:
             # СЮДА мы попадем, если у self отвалился session_id, worker_id или что-то еще
@@ -347,6 +396,8 @@ class UniversalWorker(QObject):
         try:
             # 1. Создаем и "захватываем" event loop для этого потока
             loop = get_worker_loop()
+            self._worker_loop = loop
+            self._wake_event = asyncio.Event()
             print(f"[WORKER LIFECYCLE] Поток {threading.get_native_id()} НАЧАЛ РАБОТУ для воркера …{self.worker_id[-4:]}…")
             
             # 2. Синхронная настройка
@@ -385,6 +436,8 @@ class UniversalWorker(QObject):
                 # Закрытием сессии управляет обработчик
                 loop.run_until_complete(self.api_handler_instance._close_thread_session_internal())
                 loop.close()
+            self._worker_loop = None
+            self._wake_event = None
             
             self.cancel()
 
@@ -456,11 +509,8 @@ class UniversalWorker(QObject):
             if not active_tasks and not self.task_manager.has_pending_tasks():
                 break
 
-            # --- ШАГ 4: Даем циклу событий "продышаться" ---
-            # Это ключевой момент. Мы не блокируем цикл с помощью wait(),
-            # а просто отдаем управление на короткое время, чтобы
-            # запущенные задачи могли выполниться.
-            await asyncio.sleep(0.1)
+            # --- ШАГ 4: Засыпаем до реального события, а не крутим polling. ---
+            await self._wait_for_next_cycle(active_tasks)
         
         if not self.check_session():
             # Обнаружена смена сессии. Этот воркер — "зомби".
@@ -475,6 +525,33 @@ class UniversalWorker(QObject):
                 # FIX: Проверяем и на asyncio.CancelledError
                 if isinstance(result, Exception) and not isinstance(result, (GracefulShutdownInterrupt, CancelledError, SuccessSignal, asyncio.CancelledError)):
                     self._post_event('log_message', {'message': f"[ERROR] Ошибка в фоновой задаче при завершении: {result}"})
+
+    async def _wait_for_next_cycle(self, active_tasks, timeout=WORKER_IDLE_WAKE_TIMEOUT_SECONDS):
+        wake_event = getattr(self, '_wake_event', None)
+        waitables = set(active_tasks)
+        wake_task = None
+
+        if wake_event is not None:
+            wake_task = asyncio.create_task(wake_event.wait())
+            waitables.add(wake_task)
+
+        if not waitables:
+            await asyncio.sleep(timeout)
+            return
+
+        done, pending = await asyncio.wait(
+            waitables,
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if wake_task is not None:
+            if wake_task in pending:
+                wake_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await wake_task
+            elif wake_task in done:
+                wake_event.clear()
 
 
     def check_session(self):
@@ -717,16 +794,10 @@ class UniversalWorker(QObject):
 
     def cancel(self):
         """Публичный метод для внешней отмены операций воркера с полной очисткой."""
-        if hasattr(self, 'bus') and self.bus:
-            try:
-                # Отключаемся от шины событий, чтобы не получать новые команды
-                self.bus.event_posted.disconnect(self.on_event)
-            except (TypeError, RuntimeError):
-                # Игнорируем ошибки, если уже были отсоединены
-                pass
-        
         # Устанавливаем флаг, который проверяется в основном асинхронном цикле
         self.is_cancelled = True
+        self.notify()
+        self._disconnect_from_bus()
         
         try:
             self.task_manager.rescue_task_by_worker_id(self.worker_id)

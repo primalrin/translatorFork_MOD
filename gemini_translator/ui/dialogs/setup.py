@@ -261,6 +261,16 @@ class InitialSetupDialog(QDialog):
         self.settings_manager = app.get_settings_manager()
         self.context_manager = app.context_manager
         self.bus = app.event_bus
+        self._uses_topic_subscription = False
+        self._event_topics = (
+            'current_proxy_status',
+            'session_started',
+            'assembly_finished',
+            'session_finished',
+            'tasks_for_retry_ready',
+            'task_state_changed',
+            'geoblock_detected',
+        )
         self.engine = app.engine
         self.engine_thread = app.engine_thread
         self.task_manager = app.task_manager if hasattr(app, 'task_manager') else None
@@ -327,7 +337,7 @@ class InitialSetupDialog(QDialog):
         self._init_lazy_ui_skeleton()
 
         # --- Подключение к глобальным событиям ---
-        app.event_bus.event_posted.connect(self.on_event)
+        self._connect_event_bus()
 
 
     def _apply_initial_geometry(self):
@@ -1210,6 +1220,28 @@ class InitialSetupDialog(QDialog):
         # Логика для geoblock остается здесь, так как она показывает модальное окно
         if self.is_session_active and event_name == 'geoblock_detected':
             self._handle_geoblock_detected()
+
+    def _connect_event_bus(self):
+        if not self.bus:
+            return
+        if hasattr(self.bus, "subscribe"):
+            for topic in self._event_topics:
+                self.bus.subscribe(topic, self.on_event)
+            self._uses_topic_subscription = True
+        elif hasattr(self.bus, "event_posted"):
+            self.bus.event_posted.connect(self.on_event)
+
+    def _disconnect_event_bus(self):
+        if not self.bus:
+            return
+        try:
+            if self._uses_topic_subscription and hasattr(self.bus, "unsubscribe"):
+                for topic in self._event_topics:
+                    self.bus.unsubscribe(topic, self.on_event)
+            elif hasattr(self.bus, "event_posted"):
+                self.bus.event_posted.disconnect(self.on_event)
+        except (TypeError, RuntimeError, ValueError):
+            pass
 
     def _open_proxy_settings(self):
         from .proxy import ProxySettingsDialog
@@ -6132,11 +6164,7 @@ class InitialSetupDialog(QDialog):
     def closeEvent(self, event):
         """Отписываемся от шины событий перед уничтожением окна."""
         if self._returning_to_main_menu:
-            if self.bus:
-                try:
-                    self.bus.event_posted.disconnect(self.on_event)
-                except (TypeError, RuntimeError):
-                    pass
+            self._disconnect_event_bus()
             return_to_main_menu()
             event.accept()
             return
@@ -6150,11 +6178,7 @@ class InitialSetupDialog(QDialog):
             event.ignore()
             return
 
-        if self.bus:
-            try:
-                self.bus.event_posted.disconnect(self.on_event)
-            except (TypeError, RuntimeError):
-                pass # Соединение уже могло быть разорвано
+        self._disconnect_event_bus()
 
         if action == "menu":
             return_to_main_menu()

@@ -70,6 +70,7 @@ class LogWidget(QWidget):
         super().__init__(parent)
         self._details_map = {}
         self._pending_log_data = []
+        self._uses_topic_subscription = False
         self._init_ui()
         self._log_flush_timer = QtCore.QTimer(self)
         self._log_flush_timer.setSingleShot(True)
@@ -81,7 +82,10 @@ class LogWidget(QWidget):
             if hasattr(app, 'event_bus'):
                 self.bus = app.event_bus
 
-        if self.bus:
+        if self.bus and hasattr(self.bus, "subscribe"):
+            self.bus.subscribe("log_message", self._on_log_message)
+            self._uses_topic_subscription = True
+        elif self.bus and hasattr(self.bus, "event_posted"):
             self.bus.event_posted.connect(self.on_event)
         else:
             print("[LogWidget WARN] Шина событий не предоставлена и не нашел его в QApplication. Логи не будут отображаться.")
@@ -108,8 +112,11 @@ class LogWidget(QWidget):
     @pyqtSlot(dict)
     def on_event(self, event_data: dict):
         if event_data.get('event') == 'log_message':
-            data = event_data.get('data', {})
-            self.append_message(data)
+            self._on_log_message(event_data)
+
+    def _on_log_message(self, event_data: dict):
+        data = event_data.get('data', {})
+        self.append_message(data)
 
     def append_message(self, data: dict):
         if not isinstance(data, dict):
@@ -280,6 +287,19 @@ class LogWidget(QWidget):
         self._details_map.clear()
         self._pending_log_data.clear()
         self._log_flush_timer.stop()
+
+    def closeEvent(self, event):
+        """Отписываемся от шины при закрытии/уничтожении виджета."""
+        if self.bus:
+            try:
+                if self._uses_topic_subscription and hasattr(self.bus, "unsubscribe"):
+                    self.bus.unsubscribe("log_message", self._on_log_message)
+                elif hasattr(self.bus, "event_posted"):
+                    self.bus.event_posted.disconnect(self.on_event)
+            except (TypeError, RuntimeError, ValueError):
+                pass
+        self._log_flush_timer.stop()
+        super().closeEvent(event)
 
     def _trim_details_map(self):
         while len(self._details_map) > MAX_STORED_DETAILS:

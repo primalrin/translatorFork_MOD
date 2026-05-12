@@ -104,8 +104,21 @@ class TranslationEngine(QObject):
             if not hasattr(app, 'event_bus'): raise RuntimeError("EventBus не найден.")
             self.bus = app.event_bus
 
-
-        self.bus.event_posted.connect(self.on_event)
+        self._uses_topic_subscription = False
+        self._event_topics = (
+            'cleanup_requested',
+            'start_session_requested',
+            'manual_stop_requested',
+            'soft_stop_requested',
+            'soft_stop_requested_v1_legacy',
+            'temporary_limit_warning_received',
+            'api_connection_healthy',
+            'fatal_error',
+            'task_finished',
+            'assembly_finished',
+            'tasks_added',
+        )
+        self._connect_to_bus()
         
 
         self.session_id = None
@@ -146,7 +159,28 @@ class TranslationEngine(QObject):
             'session_id': self.session_id,
             'data': data or {}
         }
-        self.bus.event_posted.emit(event)
+        if hasattr(self.bus, "emit_event"):
+            self.bus.emit_event(event)
+        elif hasattr(self.bus, "event_posted"):
+            self.bus.event_posted.emit(event)
+
+    def _connect_to_bus(self):
+        if hasattr(self.bus, "subscribe"):
+            for topic in self._event_topics:
+                self.bus.subscribe(topic, self.on_event)
+            self._uses_topic_subscription = True
+        else:
+            self.bus.event_posted.connect(self.on_event)
+
+    def _disconnect_from_bus(self):
+        try:
+            if self._uses_topic_subscription and hasattr(self.bus, "unsubscribe"):
+                for topic in self._event_topics:
+                    self.bus.unsubscribe(topic, self.on_event)
+            elif hasattr(self.bus, "event_posted"):
+                self.bus.event_posted.disconnect(self.on_event)
+        except (TypeError, RuntimeError, ValueError):
+            pass
 
     @pyqtSlot(dict)
     def on_event(self, event: dict):
@@ -1090,10 +1124,7 @@ class TranslationEngine(QObject):
     @pyqtSlot()    
     def cleanup(self):
         self._stop_timers()
-        try:
-            self.bus.event_posted.disconnect(self.on_event)
-        except (TypeError, RuntimeError):
-            pass
+        self._disconnect_from_bus()
 
         self.is_cancelled = True # Финальный флаг для всех
         self._terminate_all_workers()

@@ -46,6 +46,8 @@ class TaskManagementWidget(QWidget):
         super().__init__(parent)
         self._is_session_active = False # <--- НОВАЯ СТРОКА
         self._pending_ui_state = None
+        self._uses_topic_subscription = False
+        self.bus = None
         self._redraw_timer = QtCore.QTimer(self)
         self._redraw_timer.setSingleShot(True)
         self._redraw_timer.setInterval(35)
@@ -63,7 +65,13 @@ class TaskManagementWidget(QWidget):
         # ---------------------------------------------
         app = QtWidgets.QApplication.instance()
         if hasattr(app, 'event_bus'):
-            app.event_bus.event_posted.connect(self.on_event)
+            self.bus = app.event_bus
+            if hasattr(self.bus, "subscribe"):
+                self.bus.subscribe("task_state_changed", self._on_task_state_changed)
+                self.bus.subscribe("session_finished", self._on_session_finished)
+                self._uses_topic_subscription = True
+            elif hasattr(self.bus, "event_posted"):
+                self.bus.event_posted.connect(self.on_event)
         # --- КОНЕЦ ИЗМЕНЕНИЙ ---
     
     def _init_ui(self):
@@ -207,15 +215,21 @@ class TaskManagementWidget(QWidget):
             event_name = event_data.get('event')
 
             if event_name == 'task_state_changed':
-                full_state = event_data.get('data', {}).get('full_state')
-                if isinstance(full_state, list):
-                    self._pending_ui_state = full_state
-                self.redraw_ui()
+                self._on_task_state_changed(event_data)
 
             if event_name == 'session_finished':
-                QtCore.QTimer.singleShot(100, self.check_and_update_retry_button_visibility)
+                self._on_session_finished(event_data)
         except Exception as e:
             self._log_ui_error("on_event", e)
+
+    def _on_task_state_changed(self, event_data: dict):
+        full_state = event_data.get('data', {}).get('full_state')
+        if isinstance(full_state, list):
+            self._pending_ui_state = full_state
+        self.redraw_ui()
+
+    def _on_session_finished(self, _event_data: dict):
+        QtCore.QTimer.singleShot(100, self.check_and_update_retry_button_visibility)
 
     def _do_redraw(self):
         try:
@@ -275,10 +289,13 @@ class TaskManagementWidget(QWidget):
 
     def closeEvent(self, event):
         """Отписываемся от шины при закрытии/уничтожении виджета."""
-        app = QtWidgets.QApplication.instance()
-        if hasattr(app, 'event_bus'):
+        if self.bus:
             try:
-                app.event_bus.event_posted.disconnect(self.on_event)
-            except (TypeError, RuntimeError):
+                if self._uses_topic_subscription and hasattr(self.bus, "unsubscribe"):
+                    self.bus.unsubscribe("task_state_changed", self._on_task_state_changed)
+                    self.bus.unsubscribe("session_finished", self._on_session_finished)
+                elif hasattr(self.bus, "event_posted"):
+                    self.bus.event_posted.disconnect(self.on_event)
+            except (TypeError, RuntimeError, ValueError):
                 pass
         super().closeEvent(event)

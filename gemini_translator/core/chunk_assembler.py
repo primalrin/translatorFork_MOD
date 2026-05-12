@@ -19,7 +19,16 @@ class ChunkAssembler(QObject):
     def __init__(self, output_folder, project_manager=None, settings=None):
         super().__init__()
         self.bus = QtWidgets.QApplication.instance().event_bus
-        self.bus.event_posted.connect(self.on_event)
+        self._event_topics = (
+            'session_started',
+            'chunk_task_completed',
+            'task_state_changed',
+        )
+        if hasattr(self.bus, "subscribe"):
+            for topic in self._event_topics:
+                self.bus.subscribe(topic, self.on_event)
+        else:
+            self.bus.event_posted.connect(self.on_event)
         
         self.settings = settings or {}
         
@@ -91,7 +100,10 @@ class ChunkAssembler(QObject):
             'event': name, 'source': 'ChunkAssembler', 
             'session_id': self.session_id, 'data': data or {}
         }
-        self.bus.event_posted.emit(event)
+        if hasattr(self.bus, "emit_event"):
+            self.bus.emit_event(event)
+        else:
+            self.bus.event_posted.emit(event)
 
     def _build_wrapper_from_source(self, epub_path: str, original_chapter_path: str):
         with open(epub_path, "rb") as epub_file, zipfile.ZipFile(epub_file, "r") as epub_zip:

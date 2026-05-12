@@ -21,6 +21,7 @@ class StatusBarWidget(QtWidgets.QWidget):
         self.error_count = 0
         self.total_tasks = 0
         self._pending_task_state = None
+        self._uses_topic_subscription = False
 
         self._init_ui()
         self._status_flush_timer = QtCore.QTimer(self)
@@ -37,7 +38,12 @@ class StatusBarWidget(QtWidgets.QWidget):
         if not self.engine and hasattr(app, "engine"):
             self.engine = app.engine
 
-        if self.bus:
+        if self.bus and hasattr(self.bus, "subscribe"):
+            self.bus.subscribe("session_started", self._on_session_started)
+            self.bus.subscribe("session_finished", self._on_session_finished)
+            self.bus.subscribe("task_state_changed", self._on_task_state_changed)
+            self._uses_topic_subscription = True
+        elif self.bus and hasattr(self.bus, "event_posted"):
             self.bus.event_posted.connect(self.on_event)
         else:
             print("[StatusBarWidget WARN] Шина событий не предоставлена. Статус-бар не будет обновляться.")
@@ -102,19 +108,29 @@ class StatusBarWidget(QtWidgets.QWidget):
     def on_event(self, event_data: dict):
         """Слушает глобальную шину и реагирует на нужные события."""
         event_name = event_data.get("event")
-        data = event_data.get("data", {})
 
         if event_name == "session_started":
-            self.start_session(data.get("total_tasks", 0))
+            self._on_session_started(event_data)
 
         elif event_name == "session_finished":
-            self.stop_session()
+            self._on_session_finished(event_data)
 
         elif event_name == "task_state_changed":
-            full_state = data.get("full_state")
-            self._pending_task_state = full_state if isinstance(full_state, list) else None
-            if not self._status_flush_timer.isActive():
-                self._status_flush_timer.start(STATUS_FLUSH_INTERVAL_MS)
+            self._on_task_state_changed(event_data)
+
+    def _on_session_started(self, event_data: dict):
+        data = event_data.get("data", {})
+        self.start_session(data.get("total_tasks", 0))
+
+    def _on_session_finished(self, _event_data: dict):
+        self.stop_session()
+
+    def _on_task_state_changed(self, event_data: dict):
+        data = event_data.get("data", {})
+        full_state = data.get("full_state")
+        self._pending_task_state = full_state if isinstance(full_state, list) else None
+        if not self._status_flush_timer.isActive():
+            self._status_flush_timer.start(STATUS_FLUSH_INTERVAL_MS)
 
     def _flush_pending_task_state(self):
         ui_state_list = self._pending_task_state
@@ -236,8 +252,13 @@ class StatusBarWidget(QtWidgets.QWidget):
         """Отписываемся от шины при закрытии/уничтожении виджета."""
         if self.bus:
             try:
-                self.bus.event_posted.disconnect(self.on_event)
-            except (TypeError, RuntimeError):
+                if self._uses_topic_subscription and hasattr(self.bus, "unsubscribe"):
+                    self.bus.unsubscribe("session_started", self._on_session_started)
+                    self.bus.unsubscribe("session_finished", self._on_session_finished)
+                    self.bus.unsubscribe("task_state_changed", self._on_task_state_changed)
+                elif hasattr(self.bus, "event_posted"):
+                    self.bus.event_posted.disconnect(self.on_event)
+            except (TypeError, RuntimeError, ValueError):
                 pass
         self._status_flush_timer.stop()
         super().closeEvent(event)
