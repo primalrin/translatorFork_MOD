@@ -3417,6 +3417,51 @@ def sanitize_partial_translation(partial_text):
     return cleaned
 
 
+_PARTIAL_MERGE_MIN_OVERLAP = 24
+_PARTIAL_MERGE_MAX_OVERLAP_SCAN = 4000
+_PARTIAL_RESTART_PROBE_CHARS = 120
+
+
+def _partial_head_probe(text, limit=_PARTIAL_RESTART_PROBE_CHARS):
+    """Начало текста без разнобоя в пробелах — для сравнения «то же самое начало?»."""
+    return re.sub(r'\s+', ' ', (text or "")[:limit * 6]).strip()[:limit]
+
+
+def merge_partial_with_overlap_guard(previous_text, new_text):
+    """
+    Приклеивает свежий кусок ответа к уже накопленному частичному переводу.
+
+    Возвращает (склеенный_текст, длина_срезанного_перекрытия).
+
+    Три случая:
+    * модель продолжила с места обрыва — просто дописываем;
+    * модель повторила хвост накопленного — срезаем перекрытие;
+    * модель начала перевод заново — берём более полный из двух вариантов,
+      иначе начало главы задвоится и валидатор завалит результат.
+    """
+    if not previous_text:
+        return new_text or "", 0
+    if not new_text:
+        return previous_text, 0
+
+    previous_probe = _partial_head_probe(previous_text)
+    if previous_probe and len(previous_probe) >= _PARTIAL_RESTART_PROBE_CHARS:
+        if _partial_head_probe(new_text).startswith(previous_probe):
+            return (new_text if len(new_text) >= len(previous_text) else previous_text), 0
+
+    max_overlap = min(len(previous_text), len(new_text), _PARTIAL_MERGE_MAX_OVERLAP_SCAN)
+    if max_overlap < _PARTIAL_MERGE_MIN_OVERLAP:
+        return previous_text + new_text, 0
+
+    for candidate_text in (new_text, new_text.lstrip()):
+        candidate_max_overlap = min(len(previous_text), len(candidate_text), max_overlap)
+        for overlap_len in range(candidate_max_overlap, _PARTIAL_MERGE_MIN_OVERLAP - 1, -1):
+            if previous_text[-overlap_len:] == candidate_text[:overlap_len]:
+                return previous_text + candidate_text[overlap_len:], overlap_len
+
+    return previous_text + new_text, 0
+
+
 def validate_html_structure(original_html, translated_html):
     """
     Умная валидация ответа с глубокой проверкой структуры.

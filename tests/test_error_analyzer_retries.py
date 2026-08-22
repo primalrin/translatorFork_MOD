@@ -68,36 +68,49 @@ class ErrorAnalyzerRetryTests(unittest.TestCase):
         self.assertEqual(action, WorkerAction.FAIL_PERMANENTLY)
         self.assertEqual(error_type.name, "VALIDATION")
 
-    def test_partial_completion_does_not_create_chunk_when_chunk_options_are_disabled(self):
+    def test_partial_completion_keeps_the_task_a_whole_chapter(self):
         worker = _DummyWorker()
         emerger = EmergencyTask(worker)
-        task_info = ("task-id", ("epub", "missing.epub", "Text/ch.xhtml"))
-        exc = PartialGenerationError("partial", "<p>translated</p>", "MAX_TOKENS")
-
-        mutated = emerger._mutate_task_for_completion(task_info, exc)
-
-        self.assertEqual(mutated, task_info)
-        self.assertIn("epub_chunk", worker.events[-1][1]["message"])
-
-    def test_partial_completion_still_uses_chunk_when_chunk_on_error_is_enabled(self):
-        with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as epub_file:
-            epub_path = epub_file.name
-        self.addCleanup(lambda: os.path.exists(epub_path) and os.remove(epub_path))
-        with zipfile.ZipFile(epub_path, "w") as epub_zip:
-            epub_zip.writestr("Text/ch.xhtml", "<html><body><p>source</p></body></html>")
-
-        worker = _DummyWorker()
-        worker.chunk_on_error = True
-        emerger = EmergencyTask(worker)
-        task_info = ("task-id", ("epub", epub_path, "Text/ch.xhtml"))
+        task_info = ("task-id", ("epub", "book.epub", "Text/ch.xhtml"))
         exc = PartialGenerationError("partial", "<p>translated</p>", "MAX_TOKENS")
 
         task_id, payload = emerger._mutate_task_for_completion(task_info, exc)
 
+        # Глава остаётся главой: раньше её переодевали в 'epub_chunk' 0/1,
+        # и в списке задач она навсегда становилась «ЧАНК 1/1».
         self.assertEqual(task_id, "task-id")
-        self.assertEqual(payload[0], "epub_chunk")
-        self.assertEqual(payload[5], 1)
-        self.assertEqual(payload[-1], "<p>translated</p>")
+        self.assertEqual(payload, ("epub", "book.epub", "Text/ch.xhtml", "<p>translated</p>"))
+
+    def test_partial_completion_does_not_depend_on_chunk_settings(self):
+        worker = _DummyWorker()
+        worker.chunking = False
+        worker.chunk_on_error = False
+        emerger = EmergencyTask(worker)
+        task_info = ("task-id", ("epub", "book.epub", "Text/ch.xhtml"))
+        exc = PartialGenerationError("partial", "<p>translated</p>", "MAX_TOKENS")
+
+        _, payload = emerger._mutate_task_for_completion(task_info, exc)
+
+        self.assertEqual(payload[0], "epub")
+        self.assertEqual(payload[3], "<p>translated</p>")
+
+    def test_second_truncation_extends_the_chapter_partial(self):
+        worker = _DummyWorker()
+        emerger = EmergencyTask(worker)
+        head = (
+            "<p>Первый абзац главы, с которого начинается перевод: герой выходит из дома "
+            "и щурится на утреннее солнце, вспоминая вчерашний разговор.</p>"
+        )
+        tail = "\n<p>Продолжение, дописанное во второй попытке.</p>"
+        task_info = ("task-id", ("epub", "book.epub", "Text/ch.xhtml", head))
+
+        _, payload = emerger._mutate_task_for_completion(
+            task_info, PartialGenerationError("partial", tail, "MAX_TOKENS")
+        )
+
+        self.assertEqual(len(payload), 4)
+        self.assertTrue(payload[3].startswith(head))
+        self.assertIn("Продолжение", payload[3])
 
 
 if __name__ == "__main__":

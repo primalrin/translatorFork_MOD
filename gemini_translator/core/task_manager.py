@@ -594,7 +594,31 @@ class ChapterQueueManager(QObject):
             LIMIT 1
         """
 
-    def _restore_snapshot_payload(self, payload: tuple, current_epub_path: str) -> tuple:
+    # Незавершённые статусы, в которых чанк 1/1 можно безопасно вернуть к главе.
+    _DEMOTABLE_SINGLE_CHUNK_STATUSES = frozenset({'pending', 'failed', 'held', 'in_progress'})
+
+    def _demote_legacy_single_chunk(self, payload: tuple, status: str | None) -> tuple:
+        """
+        Возвращает «ЧАНК 1/1» к обычной задаче главы.
+
+        Такие задачи — наследство старой схемы до-генерации, где оборванная
+        глава переодевалась в 'epub_chunk' 0/1 и навсегда оставалась чанком в
+        списке. Хвост перевода при этом отбрасываем: у старых задач он мог быть
+        фрагментом из середины главы, с которым до-генерация не сходится.
+        Готовые чанки не трогаем — их ждёт сборщик.
+        """
+        if status not in self._DEMOTABLE_SINGLE_CHUNK_STATUSES:
+            return payload
+        if not payload or payload[0] != 'epub_chunk' or len(payload) < 6:
+            return payload
+        try:
+            if int(payload[5]) != 1:
+                return payload
+        except (TypeError, ValueError):
+            return payload
+        return ('epub', payload[1], payload[2])
+
+    def _restore_snapshot_payload(self, payload: tuple, current_epub_path: str, status: str | None = None) -> tuple:
         """
         Освежает путь к EPUB внутри восстановленного payload.
         После перезапуска старые виртуальные пути больше невалидны,
@@ -607,6 +631,7 @@ class ChapterQueueManager(QObject):
             return payload
 
         refreshed_payload = (payload[0], current_epub_path, *payload[2:])
+        refreshed_payload = self._demote_legacy_single_chunk(refreshed_payload, status)
         return self._normalize_payload(refreshed_payload)
 
     def add_priority_tasks(self, tasks: list, parent_history: dict = None, parent_task_id=None):
@@ -2655,6 +2680,7 @@ class ChapterQueueManager(QObject):
                     "SELECT task_id, payload, status FROM tasks ORDER BY priority DESC, sequence ASC"
                 )
                 payload_updates = []
+                demoted_single_chunks = 0
 
                 for row in cursor.fetchall():
                     try:
@@ -2662,12 +2688,16 @@ class ChapterQueueManager(QObject):
                     except Exception:
                         continue
 
-                    refreshed_payload = self._restore_snapshot_payload(payload, current_epub_path)
+                    refreshed_payload = self._restore_snapshot_payload(
+                        payload, current_epub_path, row['status']
+                    )
                     if refreshed_payload != payload:
                         payload_updates.append((
                             json.dumps(refreshed_payload, default=tuple_serializer),
                             row['task_id']
                         ))
+                    if payload[0] == 'epub_chunk' and refreshed_payload[0] == 'epub':
+                        demoted_single_chunks += 1
 
                     for chapter in self._extract_chapters_from_payload(refreshed_payload):
                         if chapter not in seen_chapters:
@@ -2681,6 +2711,12 @@ class ChapterQueueManager(QObject):
                     mem_conn.executemany(
                         "UPDATE tasks SET payload = ? WHERE task_id = ?",
                         payload_updates
+                    )
+
+                if demoted_single_chunks:
+                    self._log(
+                        f"[DB] ♻️ Возвращено к обычным главам: {demoted_single_chunks} "
+                        "задач вида «ЧАНК 1/1» из старых запусков."
                     )
 
                 if rescued_in_progress:

@@ -714,7 +714,7 @@ class UniversalWorker:
                 raise GracefulShutdownInterrupt()
     
             elif action in (WorkerAction.RETRY_COUNTABLE, WorkerAction.RETRY_NON_COUNTABLE):
-                task_to_requeue = self.emerger._mutate_task_for_completion(task_info, original_exc)
+                task_to_requeue = self.emerger._mutate_task_for_completion(task_info, original_exc, task_history)
                 status = 'REQUEUED_COUNTABLE' if action == WorkerAction.RETRY_COUNTABLE else 'REQUEUED_NON_COUNTABLE'
                 self._handle_task_result((task_to_requeue, False, status, f'Возврат в очередь ({error_type.name})'))
     

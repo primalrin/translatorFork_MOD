@@ -12,11 +12,25 @@ from gemini_translator.utils.epub_json import (
 from gemini_translator.utils.epub_tools import normalize_epub_chapter_heading_to_h1
 from gemini_translator.utils.translated_paths import build_translated_output_path
 from gemini_translator.utils.text import (
-    process_body_tag, is_content_effectively_empty, clean_html_content, validate_html_structure
+    process_body_tag, is_content_effectively_empty, clean_html_content,
+    merge_partial_with_overlap_guard, validate_html_structure
 )
 
 
 class EpubSingleFileProcessor(BaseTaskProcessor):
+    @staticmethod
+    def extract_partial_translation(task_payload):
+        """
+        Хвост оборванного перевода живёт в payload[3] обычной задачи 'epub'.
+
+        Раньше ради до-генерации главу переодевали в 'epub_chunk' 0/1 — и она
+        так и оставалась в списке «ЧАНК 1/1». Теперь глава остаётся главой.
+        """
+        if len(task_payload) <= 3:
+            return ""
+        partial = task_payload[3]
+        return partial if isinstance(partial, str) and partial.strip() else ""
+
     async def _execute_json_pipeline(self, task_info, body_content, original_content, internal_chapter_path, log_prefix, use_stream):
         document_model = build_html_document_model(original_content, document_id=internal_chapter_path)
         user_prompt, _, _, source_payload = self.worker.prompt_builder.prepare_json_for_api(
@@ -56,7 +70,13 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
         except IndexError:
             raise ValueError(f"Некорректный формат задачи epub: {task_payload}")
 
+        partial_translation = self.extract_partial_translation(task_payload)
+        # Хвост не должен пережить задачу: наружу отдаём payload без него.
+        base_task_info = (task_id, tuple(task_payload[:3]))
+
         log_prefix = f"{os.path.basename(internal_chapter_path)} (ключ …{self.worker.api_key[-4:]})"
+        if partial_translation:
+            log_prefix += " [Доперевод]"
 
         if self.worker.is_cancelled:
             return task_info, False, 'CANCELLED', "Отменено пользователем"
@@ -77,16 +97,16 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
 
         if not body_content.strip():
             self._copy_original_as_result(out_path, original_content, internal_chapter_path, version_suffix)
-            return task_info, True, 'SUCCESS', "Файл пуст или с пустым <body>, скопирован."
+            return base_task_info, True, 'SUCCESS', "Файл пуст или с пустым <body>, скопирован."
 
         segmented_text = self.worker.context_manager.prepare_html_for_translation(body_content)
         content_with_placeholders = self.worker.prompt_builder._replace_media_with_placeholders(segmented_text)
 
         if is_content_effectively_empty(content_with_placeholders):
             self._copy_original_as_result(out_path, original_content, internal_chapter_path, version_suffix)
-            return task_info, True, 'SUCCESS', "Пропущено (нет текста, только медиа/теги), оригинал скопирован."
+            return base_task_info, True, 'SUCCESS', "Пропущено (нет текста, только медиа/теги), оригинал скопирован."
 
-        use_json_pipeline = self._should_use_json_epub_pipeline()
+        use_json_pipeline = self._should_use_json_epub_pipeline() and not partial_translation
         if use_json_pipeline:
             try:
                 raw_response, translated_full_html, source_payload = await self._execute_json_pipeline(
@@ -124,15 +144,23 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
                     details_title=f"JSON-пакет для '{os.path.basename(internal_chapter_path)}'",
                     preview_limit=4000,
                 )
-                return (task_info, success_payload), True, 'SUCCESS', ""
+                return (base_task_info, success_payload), True, 'SUCCESS', ""
             except (ValidationFailedError, PartialGenerationError, ValueError) as json_error:
                 self.worker._post_event('log_message', {
                     'message': f"[JSON EPUB] Откат на legacy HTML для '{os.path.basename(internal_chapter_path)}': {json_error}"
                 })
 
+        completion_data = None
+        if partial_translation:
+            completion_data = {
+                'original_content': body_content,
+                'partial_translation': clean_html_content(partial_translation, is_html=False),
+            }
+
         user_prompt, _, _ = self.worker.prompt_builder.prepare_for_api(
             body_content,
             self.worker.system_instruction,
+            completion_data=completion_data,
             current_chapters_list=[internal_chapter_path]
         )
 
@@ -162,7 +190,19 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
                 e.partial_text = clean_html_content(e.partial_text, is_html=False)
             raise e
 
-        cleaned_response = clean_html_content(raw_response, is_html=original_was_a_body)
+        if partial_translation:
+            accumulated_raw_html, overlap_len = merge_partial_with_overlap_guard(
+                clean_html_content(partial_translation, is_html=False),
+                clean_html_content(raw_response, is_html=False),
+            )
+            cleaned_response = clean_html_content(accumulated_raw_html, is_html=original_was_a_body)
+            self.worker._post_event('log_message', {'message': (
+                f"[INFO] Доперевод главы '{os.path.basename(internal_chapter_path)}' склеен"
+                + (f" (перекрытие {overlap_len} симв. срезано)." if overlap_len else ".")
+            )})
+        else:
+            cleaned_response = clean_html_content(raw_response, is_html=original_was_a_body)
+
         original_body_with_placeholders = self.worker.prompt_builder._replace_media_with_placeholders(body_content)
 
         if not getattr(self.worker, "force_accept", False):
@@ -200,7 +240,7 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
             details_title=f"Полученный пакет для '{os.path.basename(internal_chapter_path)}'",
             preview_limit=4000,
         )
-        return (task_info, success_payload), True, 'SUCCESS', ""
+        return (base_task_info, success_payload), True, 'SUCCESS', ""
 
     def _copy_original_as_result(self, out_path, content, internal_path, suffix):
         """Копирует оригинал на диск и регистрирует его в проекте."""

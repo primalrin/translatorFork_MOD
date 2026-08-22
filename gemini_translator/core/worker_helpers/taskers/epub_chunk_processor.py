@@ -12,33 +12,15 @@ from gemini_translator.utils.epub_tools import normalize_epub_chapter_heading_to
 from gemini_translator.utils.text import (
     is_content_effectively_empty,
     clean_html_content,
+    merge_partial_with_overlap_guard,
     validate_html_structure,
     coerce_translated_body_block,
 )
 
 
 class EpubChunkProcessor(BaseTaskProcessor):
-    _MIN_OVERLAP_TO_DEDUP = 24
-    _MAX_OVERLAP_SCAN = 4000
-
     def _merge_with_overlap_guard(self, partial_text: str, new_text: str):
-        if not partial_text:
-            return new_text, 0
-        if not new_text:
-            return partial_text, 0
-
-        max_overlap = min(len(partial_text), len(new_text), self._MAX_OVERLAP_SCAN)
-        if max_overlap < self._MIN_OVERLAP_TO_DEDUP:
-            return partial_text + new_text, 0
-
-        candidates = (new_text, new_text.lstrip())
-        for candidate_text in candidates:
-            candidate_max_overlap = min(len(partial_text), len(candidate_text), max_overlap)
-            for overlap_len in range(candidate_max_overlap, self._MIN_OVERLAP_TO_DEDUP - 1, -1):
-                if partial_text[-overlap_len:] == candidate_text[:overlap_len]:
-                    return partial_text + candidate_text[overlap_len:], overlap_len
-
-        return partial_text + new_text, 0
+        return merge_partial_with_overlap_guard(partial_text, new_text)
 
     def _normalize_body_wrapper(self, original_html: str, translated_html: str):
         return coerce_translated_body_block(original_html, translated_html)

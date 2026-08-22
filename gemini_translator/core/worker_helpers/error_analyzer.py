@@ -92,7 +92,10 @@ class ErrorAnalyzer:
         if error_for_rules == ErrorType.PARTIAL_GENERATION:
             partial_text = getattr(exc, 'partial_text', '')
             reason = getattr(exc, 'reason', 'OTHER').upper()
-            is_first_attempt = (task_payload[0] == 'epub') or (task_payload[0] == 'epub_chunk' and len(task_payload) <= 8)
+            is_first_attempt = (
+                (task_payload[0] == 'epub' and len(task_payload) <= 3)
+                or (task_payload[0] == 'epub_chunk' and len(task_payload) <= 8)
+            )
 
             if not partial_text.strip() and is_first_attempt:
                 # ЭСКАЛАЦИЯ: Пустой хвост на первой попытке. Перезаписываем ошибку для правил.
