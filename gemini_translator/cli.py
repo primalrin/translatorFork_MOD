@@ -378,8 +378,7 @@ def _read_api_key_file(path: str | None) -> list[str]:
         raise CliError(f"API key file not found: {path}")
 
 
-def _configured_provider_keys(settings_manager, provider_id: str) -> list[str]:
-    key_statuses = settings_manager.load_key_statuses()
+def _configured_provider_keys(key_statuses: list[dict], provider_id: str) -> list[str]:
     keys = [
         item.get("key")
         for item in key_statuses
@@ -388,33 +387,62 @@ def _configured_provider_keys(settings_manager, provider_id: str) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
-def _resolve_api_keys(api_config, settings_manager, provider_id: str, saved_settings: dict, args) -> list[str]:
+def _resolve_api_keys(
+    api_config,
+    settings_manager,
+    provider_id: str,
+    model_id: str,
+    saved_settings: dict,
+    args,
+) -> list[str]:
     if not api_config.provider_requires_api_key(provider_id):
         placeholder = api_config.provider_placeholder_api_key(provider_id)
         return [placeholder] if placeholder else []
 
+    key_statuses = settings_manager.load_key_statuses()
+    provider_statuses = {
+        str(item.get("key")): item
+        for item in key_statuses
+        if isinstance(item, dict)
+        and item.get("provider") == provider_id
+        and item.get("key")
+    }
     keys = []
     keys.extend(getattr(args, "api_key", None) or [])
     keys.extend(_read_api_key_file(getattr(args, "api_key_file", None)))
     keys = [str(key).strip() for key in keys if str(key).strip()]
-    if keys:
-        return list(dict.fromkeys(keys))
-
-    active_by_provider = saved_settings.get("active_keys_by_provider")
-    if isinstance(active_by_provider, dict):
-        active = active_by_provider.get(provider_id)
-        if isinstance(active, (list, tuple, set)):
-            keys = [str(key).strip() for key in active if str(key).strip()]
+    if not keys:
+        active_by_provider = saved_settings.get("active_keys_by_provider")
+        if isinstance(active_by_provider, dict):
+            active = active_by_provider.get(provider_id)
+            if isinstance(active, (list, tuple, set)):
+                keys = [str(key).strip() for key in active if str(key).strip()]
 
     if getattr(args, "all_keys", False) or not keys:
-        keys = _configured_provider_keys(settings_manager, provider_id)
+        keys = _configured_provider_keys(key_statuses, provider_id)
 
     if not keys:
         raise CliError(
             f"No API keys available for provider: {provider_id}",
             payload={"hint": "Pass --api-key/--api-key-file or configure keys in the app."},
         )
-    return list(dict.fromkeys(keys))
+    unique_keys = list(dict.fromkeys(keys))
+    available_keys = [
+        key
+        for key in unique_keys
+        if key not in provider_statuses
+        or not settings_manager.is_key_limit_active(provider_statuses[key], model_id)
+    ]
+    if not available_keys:
+        raise CliError(
+            f"All API keys are temporarily limited for provider: {provider_id}",
+            payload={
+                "provider": provider_id,
+                "model_id": model_id,
+                "hint": "Wait for the provider quota reset or configure another key.",
+            },
+        )
+    return available_keys
 
 
 def build_session_settings(settings_manager, project_manager, chapters: list[str], args, *, require_api_keys: bool = True) -> dict:
@@ -426,7 +454,14 @@ def build_session_settings(settings_manager, project_manager, chapters: list[str
     provider_id = _resolve_provider(api_config, saved_settings, getattr(args, "provider", None))
     model_name, model_config = _resolve_model(api_config, provider_id, saved_settings, getattr(args, "model", None))
     api_keys = (
-        _resolve_api_keys(api_config, settings_manager, provider_id, saved_settings, args)
+        _resolve_api_keys(
+            api_config,
+            settings_manager,
+            provider_id,
+            str(model_config.get("id") or ""),
+            saved_settings,
+            args,
+        )
         if require_api_keys
         else []
     )

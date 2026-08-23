@@ -78,6 +78,52 @@ class SettingsLiveKeyResetTests(unittest.TestCase):
         self.assertTrue(manager._limit_maintenance_timer.isActive())
         self.assertEqual(manager._limit_maintenance_timer.interval(), 5000)
 
+    def test_loading_keys_keeps_current_limit_and_resets_an_expired_one(self):
+        manager = self._create_manager(_RecordingBus())
+        now = int(time.time())
+        expired_at = now - (48 * 60 * 60)
+        with manager.file_lock:
+            manager._cache["api_keys_with_status"] = [
+                {
+                    "key": "CURRENTLY_LIMITED_KEY",
+                    "provider": "gemini",
+                    "status_by_model": {
+                        "gemini-test-model": {
+                            "exhausted_at": now,
+                            "exhausted_level": 2,
+                            "requests": [now],
+                        }
+                    },
+                },
+                {
+                    "key": "EXPIRED_KEY",
+                    "provider": "gemini",
+                    "status_by_model": {
+                        "gemini-test-model": {
+                            "exhausted_at": expired_at,
+                            "exhausted_level": 2,
+                            "requests": [expired_at],
+                        }
+                    },
+                },
+            ]
+
+        statuses = {
+            item["key"]: item for item in manager.load_key_statuses()
+        }
+
+        self.assertTrue(
+            manager.is_key_limit_active(
+                statuses["CURRENTLY_LIMITED_KEY"], "gemini-test-model"
+            )
+        )
+        expired_status = statuses["EXPIRED_KEY"]["status_by_model"][
+            "gemini-test-model"
+        ]
+        self.assertIsNone(expired_status["exhausted_at"])
+        self.assertEqual(expired_status["exhausted_level"], 0)
+        self.assertEqual(expired_status["requests"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

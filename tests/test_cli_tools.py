@@ -10,6 +10,7 @@ from gemini_translator.cli import (
     _choose_translation_rel_path,
     _collect_untranslated_fix_items,
     _load_translated_chapter_records,
+    _resolve_api_keys,
     _resolve_model,
     _safe_settings_for_output,
     _scan_untranslated_records,
@@ -183,6 +184,63 @@ def test_resolve_model_falls_back_only_without_explicit_model():
 
     assert model_name == "Fallback Model"
     assert model_config["id"] == "fallback-model-id"
+
+
+class _KeyStatusSettingsManager:
+    def __init__(self, statuses, limited_keys):
+        self.statuses = statuses
+        self.limited_keys = set(limited_keys)
+        self.checked = []
+
+    def load_key_statuses(self):
+        return self.statuses
+
+    def is_key_limit_active(self, key_info, model_id):
+        self.checked.append((key_info["key"], model_id))
+        return key_info["key"] in self.limited_keys
+
+
+def test_resolve_api_keys_excludes_keys_with_an_active_model_limit(tmp_path):
+    statuses = [
+        {"key": "blocked-key", "provider": "fake", "status_by_model": {}},
+        {"key": "available-key", "provider": "fake", "status_by_model": {}},
+    ]
+    manager = _KeyStatusSettingsManager(statuses, {"blocked-key"})
+
+    keys = _resolve_api_keys(
+        _FakeApiConfig(),
+        manager,
+        "fake",
+        "known-model-id",
+        {"active_keys_by_provider": {"fake": ["blocked-key", "available-key"]}},
+        _session_args(tmp_path),
+    )
+
+    assert keys == ["available-key"]
+    assert manager.checked == [
+        ("blocked-key", "known-model-id"),
+        ("available-key", "known-model-id"),
+    ]
+
+
+def test_resolve_api_keys_reports_when_every_selected_key_is_limited(tmp_path):
+    secret = "limited-secret-key"
+    statuses = [{"key": secret, "provider": "fake", "status_by_model": {}}]
+    manager = _KeyStatusSettingsManager(statuses, {secret})
+
+    with pytest.raises(CliError) as exc_info:
+        _resolve_api_keys(
+            _FakeApiConfig(),
+            manager,
+            "fake",
+            "known-model-id",
+            {"active_keys_by_provider": {"fake": [secret]}},
+            _session_args(tmp_path),
+        )
+
+    assert "temporarily limited" in str(exc_info.value)
+    assert secret not in str(exc_info.value)
+    assert secret not in str(exc_info.value.payload)
 
 
 def test_build_session_settings_can_skip_api_key_resolution(monkeypatch, tmp_path):
