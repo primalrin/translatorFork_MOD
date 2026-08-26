@@ -523,6 +523,9 @@ class TranslationEngine(QObject):
         Начисляет штрафные баллы ключу.
         Если установлен лимит RPD, и текущее использование ключа > 90% от RPD,
         то ЛЮБОЕ предупреждение немедленно помечает ключ как Exhausted (красный).
+
+        Повторные временные паузы не доказывают исчерпание суточной квоты:
+        счетчик только передает ключ в механизм ротации/краткой паузы.
         """
 
         if worker_id not in self.active_workers_map:
@@ -577,33 +580,8 @@ class TranslationEngine(QObject):
         self._post_event('log_message', {
             'message': f"[MANAGER-WARN] 🟡 Ключ …{worker_key[-4:]} получил {log_message_penalty} ({current_warnings}/{self.MAX_REPEATED_WAITS})."
         })
-        
-        if current_warnings >= self.MAX_REPEATED_WAITS:
-            self._post_event('log_message', {
-                'message': f"[FATAL] ⛔ Ключ …{worker_key[-4:]} набрал максимальное количество штрафов. Считаем квоту исчерпанной."
-            })
-            
-            fake_exception = Exception("Warning limit exceeded.")
 
-            payload = {
-                "type": "quota_exceeded",
-                "model_id": model_id,
-                "exception": fake_exception
-            }
-            
-            event = {
-                'event': "fatal_error",
-                'source': f'worker_{worker_id}',
-                'worker_key': worker_key,
-                'session_id': worker_session,
-                'data': {'payload': payload}
-            }
-
-            self.bus.event_posted.emit(event)
-            
-            return True # Да, ключ был исчерпан
-            
-        return False # Нет, ключ еще в игре
+        return False # Временная пауза: ключ еще не исчерпан
 
     def _reset_key_warning_counter(self, worker_id: str):
         """Сбрасывает счетчик предупреждений для указанного ключа."""
