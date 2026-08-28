@@ -64,6 +64,9 @@ def test_portable_arguments_keep_paths_with_spaces_as_single_arguments(tmp_path,
     node = runtime_root / "node.exe"
     package = runtime_root / "package"
     browsers = tmp_path / "browser cache with spaces"
+    runtime_destination = Path("playwright_runtime")
+    package_destination = runtime_destination / "package"
+    browsers_destination = runtime_destination / "ms-playwright"
     node.parent.mkdir()
     node.write_bytes(b"node")
     package.mkdir()
@@ -74,18 +77,18 @@ def test_portable_arguments_keep_paths_with_spaces_as_single_arguments(tmp_path,
         build_runner,
         "get_additional_data_entries",
         lambda: [
-            (node, Path("playwright_runtime")),
-            (package, Path("playwright_runtime/package")),
-            (browsers, Path("playwright_runtime/ms-playwright")),
+            (node, runtime_destination),
+            (package, package_destination),
+            (browsers, browsers_destination),
         ],
     )
 
     args = build_runner.build_pyinstaller_args(mode="portable", app_name="translator work", collect_data_modules=[])
 
     assert "--name=translator work" in args
-    assert f"--add-data={node}{os.pathsep}playwright_runtime" in args
-    assert f"--add-data={package}{os.pathsep}playwright_runtime/package" in args
-    assert f"--add-data={browsers}{os.pathsep}playwright_runtime/ms-playwright" in args
+    assert f"--add-data={node}{os.pathsep}{runtime_destination}" in args
+    assert f"--add-data={package}{os.pathsep}{package_destination}" in args
+    assert f"--add-data={browsers}{os.pathsep}{browsers_destination}" in args
 
 
 @pytest.mark.parametrize(
