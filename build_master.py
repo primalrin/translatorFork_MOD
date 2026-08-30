@@ -176,17 +176,28 @@ def discover_playwright_runtime_data():
     else:
         print("     [WARN] Python-пакет 'playwright' не найден, bundled runtime не будет добавлен.")
 
+    configured_browser_cache = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
     localappdata = os.environ.get("LOCALAPPDATA")
+    browser_cache_candidates = []
+    if configured_browser_cache and configured_browser_cache != "0":
+        browser_cache_candidates.append(Path(configured_browser_cache))
     if localappdata:
-        browser_cache = Path(localappdata) / "ms-playwright"
-        if project_browser_cache.exists():
-            pass
-        elif browser_cache.exists():
-            discovered.append((browser_cache, Path("playwright_runtime") / "ms-playwright"))
+        browser_cache_candidates.append(Path(localappdata) / "ms-playwright")
+
+    if not project_browser_cache.exists():
+        browser_cache = next(
+            (candidate for candidate in browser_cache_candidates if candidate.exists()),
+            None,
+        )
+        if browser_cache is not None:
+            discovered.append(
+                (browser_cache, Path("playwright_runtime") / "ms-playwright")
+            )
         else:
-            print("     [WARN] Локальный cache ms-playwright не найден, bundled browser cache будет пропущен.")
-    else:
-        print("     [WARN] Переменная LOCALAPPDATA не задана, bundled browser cache будет пропущен.")
+            print(
+                "     [WARN] Cache браузеров Playwright не найден, "
+                "bundled browser cache будет пропущен."
+            )
 
     return discovered
 
@@ -330,92 +341,25 @@ def analyze_dependencies_for_pyinstaller_flags(dependencies):
 
 def generate_pure_bat_script(dependencies, collect_data_flags):
     print(f"\n--- Этап 6: Генерация универсального лаунчера '{OUTPUT_BAT_FILE}' ---")
-    
-    hooks_block = []
-    try:
-        import pyinstaller_hooks_contrib
-        hooks_path = pyinstaller_hooks_contrib.get_hook_dirs()[0]
-        hooks_block.append(f'--additional-hooks-dir="{hooks_path}"')
-        print("[OK] Найдены хуки сообщества (pyinstaller-hooks-contrib).")
-    except (ImportError, IndexError):
-        print("[ПРЕДУПРЕЖДЕНИЕ] pyinstaller-hooks-contrib не найден.")
-    
+
     collect_data_modules = set(collect_data_flags)
     collect_data_modules.update(MANUAL_COLLECT_DATA_MODULES)
-    data_block = [f'--collect-data="{data}"' for data in sorted(list(collect_data_modules))]
-    
-    base_pyinstaller_args = [f'"%PYTHON_CMD%" -m PyInstaller {MAIN_PY_FILE}', "--windowed",
-        '--name="%AppName%"', "--clean", f'--icon="{APP_ICON_FILE}"', "--noconfirm"]
-    base_pyinstaller_args.extend(hooks_block)
-    base_pyinstaller_args.extend(data_block)
-    
-    hidden_imports_args = [f'--hidden-import="{imp}"' for imp in HIDDEN_IMPORTS_BLOCK]
-    base_pyinstaller_args.extend(hidden_imports_args)
 
-    # --- НОВАЯ ЛОГИКА ДЛЯ DATA ---
-    # Эти аргументы теперь будут ОБЩИМИ для ВСЕХ режимов сборки.
-    # Все файлы из ADDITIONAL_DATA всегда упаковываются внутрь.
-    add_data_args = []
-    copy_commands_hybrid = []
-    copy_commands_advanced = []
-    
-    print("  -> Анализ ADDITIONAL_DATA для включения в сборку:")
-    for item in get_additional_data_entries():
-        path, destination = normalize_data_entry(item)
-        if not path.exists():
-            print(f"     [WARN] Элемент не найден и будет пропущен: {path}")
-            continue
+    collect_data_args = [
+        f'--collect-data="{module}"' for module in sorted(collect_data_modules)
+    ]
 
-        is_directory = path.is_dir()
-        file_name = path.name
+    def build_runner_command(mode):
+        runner_args = [
+            f'"%PYTHON_CMD%" build_runner.py --mode {mode}',
+            '--name="%AppName%"',
+            *collect_data_args,
+        ]
+        return " ^\n".join(runner_args)
 
-        try:
-            path = path.relative_to(PROJECT_ROOT)
-        except ValueError:
-            localappdata = os.environ.get("LOCALAPPDATA")
-            if localappdata and str(path).startswith(localappdata):
-                path_str = str(path).replace(localappdata, "%LOCALAPPDATA%")
-                path = Path(path_str)
-
-        destination_str = str(destination) if str(destination) else '.'
-        display_source = str(path)
-        if is_directory:
-            print(f"     - Папка: {display_source} -> {destination_str}")
-        else:
-            print(f"     - Файл:  {display_source} -> {destination_str}")
-
-        add_data_args.append(f'--add-data "{path};{destination_str}"')
-
-        src_win = str(path).replace('/', '\\')
-        dest_win = destination_str.replace('/', '\\')
-
-        if is_directory:
-            copy_commands_hybrid.append(f'    xcopy "{src_win}" "dist\\{dest_win}\\" /E /I /Y /Q > nul')
-            copy_commands_advanced.append(f'    xcopy "{src_win}" "dist\\%AppName%\\{dest_win}\\" /E /I /Y /Q > nul')
-        else:
-            if dest_win not in ("", "."):
-                copy_commands_hybrid.append(f'    if not exist "dist\\{dest_win}" mkdir "dist\\{dest_win}"')
-                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{dest_win}\\{file_name}" > nul')
-                copy_commands_advanced.append(f'    if not exist "dist\\%AppName%\\{dest_win}" mkdir "dist\\%AppName%\\{dest_win}"')
-                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{dest_win}\\{file_name}" > nul')
-            else:
-                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{file_name}" > nul')
-                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{file_name}" > nul')
-
-    # Команда для ПОЛНОСТЬЮ ПОРТАТИВНОЙ сборки (включает --add-data)
-    full_portable_args = list(base_pyinstaller_args) + ["--onefile"] + add_data_args
-    pyinstaller_command_full_portable = " ^\n".join(full_portable_args)
-
-    # Команда для ГИБРИДНОЙ сборки (теперь ТОЖЕ включает --add-data)
-    hybrid_args = list(base_pyinstaller_args) + ["--onefile"]
-    pyinstaller_command_hybrid = " ^\n".join(hybrid_args)
-    
-    # Команда для ПРОДВИНУТОЙ сборки (теперь ТОЖЕ включает --add-data)
-    advanced_args = list(base_pyinstaller_args)
-    pyinstaller_command_advanced = " ^\n".join(advanced_args)
-    
-    hybrid_copy_block = "\n".join(copy_commands_hybrid)
-    advanced_copy_block = "\n".join(copy_commands_advanced)
+    pyinstaller_command_full_portable = build_runner_command("portable")
+    pyinstaller_command_hybrid = build_runner_command("hybrid")
+    pyinstaller_command_advanced = build_runner_command("advanced")
     clean_bat_content = f"""@echo off
 chcp 65001 >nul
 setlocal
@@ -566,12 +510,6 @@ goto :eof
 :build_hybrid
 call :build_app_base "ГИБРИДНАЯ"
 {pyinstaller_command_hybrid}
-if %ERRORLEVEL% EQU 0 (
-    echo.
-    echo [+] Этап 3 из 3: Копирование внешних данных...
-{hybrid_copy_block}
-    echo [OK] Данные скопированы.
-)
 call :build_app_end
 goto :eof
 
@@ -580,12 +518,6 @@ goto :eof
 :build_advanced
 call :build_app_base "ПРОДВИНУТАЯ"
 {pyinstaller_command_advanced}
-if %ERRORLEVEL% EQU 0 (
-    echo.
-    echo [+] Этап 3 из 3: Копирование внешних данных...
-{advanced_copy_block}
-    echo [OK] Данные скопированы.
-)
 call :build_app_end
 goto :eof
 
@@ -661,13 +593,8 @@ if %ERRORLEVEL% NEQ 0 (
     call :build_app_end
     goto :eof
 )
-
 echo.
-echo [+] Этап 3 из 4: Копирование внешних данных...
-{advanced_copy_block}
-echo [OK] Данные скопированы.
-echo.
-echo [+] Этап 4 из 4: Создание инсталлятора через Inno Setup...
+echo [+] Создание инсталлятора через Inno Setup...
 "%ISCC_CMD%" "/DAppBuildName=%AppName%" windows_installer.iss
 if errorlevel 1 (
     echo [!!!] Ошибка при создании инсталлятора.
