@@ -8,6 +8,12 @@ def test_latest_gemini_flash_models_are_configured():
     models = providers["gemini"]["models"]
 
     expected = {
+        "Gemini 3.8 Flash": {
+            "id": "gemini-3.8-flash",
+            "rpm": 5,
+            "rpd": 20,
+            "max_concurrent_requests": 10,
+        },
         "Gemini 3.7 Flash": {
             "id": "gemini-3.7-flash",
             "rpm": 5,
