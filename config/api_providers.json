@@ -16,6 +16,23 @@
       "reset_minute": 1
     },
     "models": {
+      "Gemini 3.8 Flash": {
+        "id": "gemini-3.8-flash",
+        "rpm": 5,
+        "tpm": 250000,
+        "rpd": 20,
+        "context_length": 230000,
+        "needs_chunking": true,
+        "max_concurrent_requests": 10,
+        "max_output_tokens": 65536,
+        "thinkingLevel": [
+          "high",
+          "medium",
+          "low",
+          "minimal"
+        ],
+        "min_thinking_budget": "minimal"
+      },
       "Gemini 3.7 Flash": {
         "id": "gemini-3.7-flash",
         "rpm": 5,
