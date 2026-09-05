@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""QidianCreatorPage — Qidian/Fanqie/Ciweimao → Rulate creator as an embeddable ShellPage."""
+"""QidianCreatorPage — Qidian/Fanqie/Ciweimao/Qimao → Rulate creator as an embeddable ShellPage."""
 
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ class _CoverDropLabel(QLabel):
 
 
 class QidianCreatorPage(ShellPage):
-    page_title = "Qidian/Fanqie/Ciweimao → Rulate"
+    page_title = "Qidian/Fanqie/Ciweimao/Qimao → Rulate"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -204,7 +204,7 @@ class QidianCreatorPage(ShellPage):
         url_row.addWidget(QLabel("URL источника:"))
         self.qidian_url_edit = QLineEdit("https://www.qidian.com/book/1041604040/")
         self.qidian_url_edit.setPlaceholderText(
-            "Qidian, Fanqie или https://www.ciweimao.com/book/100441110"
+            "Qidian, Fanqie, Ciweimao или https://www.qimao.com/shuku/195958/"
         )
         url_row.addWidget(self.qidian_url_edit, 1)
         self.visible_qidian_checkbox = QCheckBox("Открывать источник видимо")
@@ -408,7 +408,8 @@ class QidianCreatorPage(ShellPage):
                 "Источник",
                 "Введите ссылку вида https://www.qidian.com/book/1041604040/ "
                 "или https://fanqienovel.com/page/7229603492648717324 "
-                "или https://www.ciweimao.com/book/100441110",
+                "или https://www.ciweimao.com/book/100441110 "
+                "или https://www.qimao.com/shuku/195958/",
             )
             return
         self.fetch_qidian_btn.setEnabled(False)
@@ -464,7 +465,8 @@ class QidianCreatorPage(ShellPage):
                 "Обложка",
                 "Введите ссылку вида https://www.qidian.com/book/1041604040/ "
                 "или https://fanqienovel.com/page/7229603492648717324 "
-                "или https://www.ciweimao.com/book/100441110",
+                "или https://www.ciweimao.com/book/100441110 "
+                "или https://www.qimao.com/shuku/195958/",
             )
             return
 

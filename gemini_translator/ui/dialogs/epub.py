@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import json
 import html as html_lib
+import unicodedata
 from xml.etree import ElementTree as ET
 
 from defusedxml import ElementTree as SafeET
@@ -553,12 +554,23 @@ class EpubHtmlSelectorDialog(QDialog):
     """
     _final_epub_path = None
     
-    def __init__(self, epub_filename, output_folder=None, parent=None, pre_selected_chapters=None, project_manager=None):
+    def __init__(
+        self,
+        epub_filename,
+        output_folder=None,
+        parent=None,
+        pre_selected_chapters=None,
+        project_manager=None,
+        previous_translated_chapter_titles=None,
+    ):
         super().__init__(parent)
         self.real_epub_path = epub_filename # Сохраняем реальный путь для финального сохранения
         self.output_folder = output_folder
         self.project_manager = project_manager
         self.pre_selected_chapters = pre_selected_chapters or []
+        self.previous_translated_chapter_titles = list(
+            previous_translated_chapter_titles or []
+        )
         
         # --- Состояние ---
         self.virtual_epub_path = None # Будет инициализирован асинхронно
@@ -570,6 +582,7 @@ class EpubHtmlSelectorDialog(QDialog):
         self.untranslated_chapters = []
         self._size_cache = {}
         self._chapter_title_cache = {}
+        self._previous_source_selection_cutoff = None
         self._current_filter_mode = self._show_all_chapters
         self._is_virtual_file_dirty = False # Флаг, что виртуальный файл был изменен
         self.deep_cleanup_settings = load_deep_cleanup_settings()
@@ -578,7 +591,14 @@ class EpubHtmlSelectorDialog(QDialog):
         self._init_lazy_ui_skeleton()
     
     @staticmethod
-    def get_selection(parent, epub_filename, output_folder=None, pre_selected_chapters=None, project_manager=None):
+    def get_selection(
+        parent,
+        epub_filename,
+        output_folder=None,
+        pre_selected_chapters=None,
+        project_manager=None,
+        previous_translated_chapter_titles=None,
+    ):
         """
         Статический метод-фабрика. Создает, запускает диалог и возвращает результат.
         Это инкапсулирует всю логику работы с модальным диалогом.
@@ -593,6 +613,7 @@ class EpubHtmlSelectorDialog(QDialog):
             parent=parent,
             pre_selected_chapters=pre_selected_chapters,
             project_manager=project_manager,
+            previous_translated_chapter_titles=previous_translated_chapter_titles,
         )
         
         result = exec_dialog(parent, dialog)
@@ -715,6 +736,10 @@ class EpubHtmlSelectorDialog(QDialog):
         # --- Основные кнопки диалога (справа) ---
         self.button_box = QDialogButtonBox()
         ok_button = QPushButton("Принять")
+        self.accept_button = ok_button
+        self.accept_button.setEnabled(
+            not getattr(self, 'previous_translated_chapter_titles', None)
+        )
         cancel_button = QPushButton("Отмена")
         self.button_box.addButton(ok_button, QDialogButtonBox.ButtonRole.AcceptRole)
         self.button_box.addButton(cancel_button, QDialogButtonBox.ButtonRole.RejectRole)
@@ -888,10 +913,14 @@ class EpubHtmlSelectorDialog(QDialog):
         selected_files_before_update = self.get_selected_files()
         self._current_filter_mode()
         
-        for i in range(self.list_widget.count()):
-            item = self.list_widget.item(i)
-            if item.data(QtCore.Qt.ItemDataRole.UserRole) in selected_files_before_update:
-                item.setSelected(True)
+        # Если в проекте уже есть переведенная часть прошлой пачки, новый
+        # выбор начинается строго после нее. Восстановление старого выделения
+        # иначе снова отметило бы уже пройденные главы.
+        if getattr(self, '_previous_source_selection_cutoff', None) is None:
+            for i in range(self.list_widget.count()):
+                item = self.list_widget.item(i)
+                if item.data(QtCore.Qt.ItemDataRole.UserRole) in selected_files_before_update:
+                    item.setSelected(True)
 
     def _populate_list_widget(self, chapters_to_show):
         self.list_widget.clear()
@@ -928,7 +957,13 @@ class EpubHtmlSelectorDialog(QDialog):
     def _load_chapter_title_cache(self):
         self._chapter_title_cache = {}
         self._title_scan_index = None
+        if (
+            getattr(self, 'previous_translated_chapter_titles', None)
+            and hasattr(self, 'accept_button')
+        ):
+            self.accept_button.setEnabled(False)
         if not self.virtual_epub_path or not self.all_chapters:
+            self._finish_chapter_title_scan()
             return
         # Ленивая догрузка: не задерживаем появление списка распаковкой и
         # декодированием ВСЕХ глав книги — сканируем батчами через очередь
@@ -943,7 +978,7 @@ class EpubHtmlSelectorDialog(QDialog):
             return
         chapters = self.all_chapters[start:start + BATCH]
         if not chapters:
-            self._title_scan_index = None
+            self._finish_chapter_title_scan()
             return
 
         scanned = {}
@@ -962,7 +997,7 @@ class EpubHtmlSelectorDialog(QDialog):
                         scanned[file_path] = title
         except Exception as e:
             print(f"[WARN] Failed to load EPUB chapter titles: {e}")
-            self._title_scan_index = None
+            self._finish_chapter_title_scan()
             return
 
         self._chapter_title_cache.update(scanned)
@@ -970,6 +1005,12 @@ class EpubHtmlSelectorDialog(QDialog):
         if scanned:
             self._refresh_tooltips_for_paths(set(scanned))
         QtCore.QTimer.singleShot(0, self._scan_chapter_titles_batch)
+
+    def _finish_chapter_title_scan(self):
+        self._title_scan_index = None
+        self._apply_previous_source_title_cutoff()
+        if hasattr(self, 'accept_button'):
+            self.accept_button.setEnabled(True)
 
     def _refresh_tooltips_for_paths(self, paths):
         list_widget = getattr(self, 'list_widget', None)
@@ -989,21 +1030,121 @@ class EpubHtmlSelectorDialog(QDialog):
             item.setToolTip(f"H1: {chapter_title}\n{file_path}")
         else:
             item.setToolTip(file_path)
+
+    @staticmethod
+    def _normalize_chapter_title(title):
+        normalized = html_lib.unescape(str(title or ""))
+        normalized = unicodedata.normalize("NFKC", normalized)
+        return re.sub(r"\s+", " ", normalized).strip().casefold()
+
+    @classmethod
+    def find_previous_title_cutoff(cls, current_titles, previous_titles):
+        """Находит последнее однозначное пересечение новой и старой пачек."""
+        current = [cls._normalize_chapter_title(title) for title in current_titles or []]
+        previous = []
+        for title in previous_titles or []:
+            normalized_title = cls._normalize_chapter_title(title)
+            if normalized_title:
+                previous.append(normalized_title)
+        if not current or not previous:
+            return None
+
+        # Ищем с конца прошлой пачки: если новый файл содержит только часть
+        # старого хвоста, границей станет последняя реально повторившаяся глава.
+        for previous_index in range(len(previous) - 1, -1, -1):
+            target_title = previous[previous_index]
+            candidates = [
+                index for index, title in enumerate(current)
+                if title == target_title
+            ]
+            if not candidates:
+                continue
+            if len(candidates) == 1:
+                return candidates[0]
+
+            # Одинаковые названия разрешаем по предшествующему контексту.
+            # При равном результате границу не ставим, чтобы не пропустить текст.
+            scores = {}
+            for candidate in candidates:
+                score = 0
+                old_index = previous_index
+                new_index = candidate
+                while (
+                    old_index >= 0
+                    and new_index >= 0
+                    and previous[old_index] == current[new_index]
+                ):
+                    score += 1
+                    old_index -= 1
+                    new_index -= 1
+                scores[candidate] = score
+
+            best_score = max(scores.values())
+            best_candidates = [
+                candidate for candidate, score in scores.items()
+                if score == best_score
+            ]
+            if len(best_candidates) == 1:
+                return best_candidates[0]
+            return None
+
+        return None
+
+    def _apply_previous_source_title_cutoff(self):
+        previous_titles = getattr(
+            self,
+            'previous_translated_chapter_titles',
+            None,
+        )
+        if not previous_titles:
+            return False
+
+        current_titles = [
+            self._chapter_title_cache.get(chapter, "")
+            for chapter in self.all_chapters
+        ]
+        cutoff = self.find_previous_title_cutoff(
+            current_titles,
+            previous_titles,
+        )
+        if cutoff is None:
+            return False
+
+        self._previous_source_selection_cutoff = cutoff
+        if self._ui_is_built and self.list_widget.count():
+            self._current_filter_mode()
+        return True
+
+    def _select_chapters_after_previous_source(self):
+        cutoff = getattr(self, '_previous_source_selection_cutoff', None)
+        if cutoff is None:
+            return False
+
+        chapters_after_cutoff = set(self.all_chapters[cutoff + 1:])
+        for index in range(self.list_widget.count()):
+            item = self.list_widget.item(index)
+            file_path = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            item.setSelected(file_path in chapters_after_cutoff)
+        return True
     
     def _filter_show_untranslated(self):
         self._current_filter_mode = self._filter_show_untranslated
         self._populate_list_widget(self.untranslated_chapters)
-        self.list_widget.selectAll()
+        if not self._select_chapters_after_previous_source():
+            self.list_widget.selectAll()
 
     def _filter_show_unvalidated(self):
         self._current_filter_mode = self._filter_show_unvalidated
         combined_list = sorted(set(self.untranslated_chapters + list(self.unvalidated_chapters)), key=extract_number_from_path)
         self._populate_list_widget(combined_list)
-        self.list_widget.selectAll()
+        if not self._select_chapters_after_previous_source():
+            self.list_widget.selectAll()
 
     def _show_all_chapters(self):
         self._current_filter_mode = self._show_all_chapters
         self._populate_list_widget(self.all_chapters)
+        if self._select_chapters_after_previous_source():
+            return
         if not self.pre_selected_chapters:
             self.list_widget.selectAll()
     
@@ -1311,6 +1452,7 @@ class EpubHtmlSelectorDialog(QDialog):
         self.untranslated_chapters = []
         self._size_cache = {}
         self._chapter_title_cache = {}
+        self._previous_source_selection_cutoff = None
         self._title_scan_index = None  # останавливает цепочку батч-скана заголовков
 
         # Показываем заглушку

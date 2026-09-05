@@ -201,7 +201,7 @@ class QidianCreatorPageContractTests(unittest.TestCase):
         self.assertTrue(issubclass(QidianCreatorPage, ShellPage))
 
     def test_page_title(self):
-        self.assertEqual(QidianCreatorPage.page_title, "Qidian/Fanqie/Ciweimao → Rulate")
+        self.assertEqual(QidianCreatorPage.page_title, "Qidian/Fanqie/Ciweimao/Qimao → Rulate")
 
     def test_split_csv_dedupes_and_strips(self):
         self.assertEqual(_split_csv("a, b ,a\nc"), ["a", "b", "c"])

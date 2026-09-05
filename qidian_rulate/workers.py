@@ -27,7 +27,9 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 
 from gemini_translator.api import config as api_config
-from gemini_translator.api.errors import NetworkError, OperationCancelledError, TemporaryRateLimitError
+from gemini_translator.api.errors import (
+    NetworkError, OperationCancelledError, PartialGenerationError, TemporaryRateLimitError,
+)
 from gemini_translator.api.factory import get_api_handler_class
 
 from .models import (
@@ -63,6 +65,7 @@ CIWEIMAO_BOOK_RE = re.compile(
     r"^https?://(?:www\.)?ciweimao\.com/book/\d+/?(?:[?#].*)?$",
     re.IGNORECASE,
 )
+QIMAO_BOOK_RE = re.compile(r"^https?://(?:www\.)?qimao\.com/shuku/\d+/?(?:[?#].*)?$", re.IGNORECASE)
 RULATE_CATEGORY_URL = "https://tl.rulate.ru/book/0/edit/cat"
 RULATE_INFO_URL = "https://tl.rulate.ru/book/0/edit/info#general"
 RULATE_LOGIN_URL = "https://tl.rulate.ru/book/0/edit/info"
@@ -158,9 +161,18 @@ def validate_ciweimao_url(url: str) -> bool:
     return bool(CIWEIMAO_BOOK_RE.match((url or "").strip()))
 
 
+def validate_qimao_url(url: str) -> bool:
+    return bool(QIMAO_BOOK_RE.match((url or "").strip()))
+
+
 def validate_source_url(url: str) -> bool:
     url = (url or "").strip()
-    return validate_qidian_url(url) or validate_fanqie_url(url) or validate_ciweimao_url(url)
+    return (
+        validate_qidian_url(url)
+        or validate_fanqie_url(url)
+        or validate_ciweimao_url(url)
+        or validate_qimao_url(url)
+    )
 
 
 def _source_name(url: str) -> str:
@@ -168,6 +180,8 @@ def _source_name(url: str) -> str:
         return "Fanqie"
     if validate_ciweimao_url(url):
         return "Ciweimao"
+    if validate_qimao_url(url):
+        return "Qimao"
     return "Qidian"
 
 
@@ -1116,6 +1130,62 @@ def _fanqie_book_id(url: str) -> str:
     return match.group(1) if match else ""
 
 
+def _qimao_book_id(url: str) -> str:
+    match = re.search(r"/shuku/(\d+)", str(url or ""))
+    return match.group(1) if match else ""
+
+
+def _fetch_qimao_chapter_links(
+    source_url: str,
+    *,
+    limit: int = QIDIAN_COVER_PROMPT_CHAPTER_COUNT,
+) -> list[dict[str, str]]:
+    book_id = _qimao_book_id(source_url)
+    if not book_id:
+        return []
+    limit = max(0, int(limit))
+    if not limit:
+        return []
+
+    response = requests.get(
+        urljoin(source_url, "/api/book/chapter-list"),
+        params={"book_id": book_id},
+        timeout=20,
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Referer": source_url,
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    raw_chapters = data.get("chapters") if isinstance(data, dict) else None
+    if not isinstance(raw_chapters, list):
+        return []
+
+    links: list[dict[str, str]] = []
+    for item in raw_chapters:
+        if not isinstance(item, dict):
+            continue
+        chapter_id = str(item.get("id") or "").strip()
+        if not chapter_id.isdigit():
+            continue
+        links.append(
+            {
+                "href": urljoin(source_url, f"/shuku/{book_id}-{chapter_id}/"),
+                "title": _clean_text(item.get("title")),
+            }
+        )
+        if len(links) >= limit:
+            break
+    return links
+
+
 def _tomato_web_base_url() -> str:
     value = os.environ.get(TOMATO_WEB_URL_ENV, TOMATO_WEB_DEFAULT_URL).strip()
     if value.lower() in {"0", "false", "off", "disabled", "none"}:
@@ -1631,6 +1701,14 @@ def _run_ai_request(
         raise ValueError(f"У провайдера '{provider_id}' не указан handler_class.")
 
     handler_class = get_api_handler_class(handler_class_name)
+    token_limit = int(model_config.get("max_output_tokens") or 32768)
+    if handler_class_name == "GeminiApiHandler" and model_config.get("min_thinking_budget") is not False:
+        # Gemini's output allowance also needs room for numeric thinking budgets.
+        minimum = model_config.get("min_thinking_budget")
+        thinking_budget = model_settings.get("thinking_budget") if model_settings.get("thinking_enabled") else 0
+        numeric_budgets = [value for value in (minimum, thinking_budget) if isinstance(value, (int, float))]
+        max_output_tokens += int(max([0, *numeric_budgets]))
+    max_output_tokens = min(max_output_tokens, token_limit)
     retryable_errors = (TemporaryRateLimitError, NetworkError)
     for attempt in range(1, AI_REQUEST_RETRY_ATTEMPTS + 1):
         if cancel_event is not None and cancel_event.is_set():
@@ -1655,6 +1733,18 @@ def _run_ai_request(
                     max_output_tokens=max_output_tokens,
                 )
             )
+        except PartialGenerationError as error:
+            if str(error.reason).upper() != "MAX_TOKENS":
+                raise
+            next_token_budget = min(max_output_tokens * 2, token_limit)
+            if attempt >= AI_REQUEST_RETRY_ATTEMPTS or next_token_budget <= max_output_tokens:
+                raise
+            log_callback(
+                "WARNING",
+                f"AI: достигнут лимит {max_output_tokens} токенов; "
+                f"повтор {attempt + 1}/{AI_REQUEST_RETRY_ATTEMPTS} с лимитом {next_token_budget}.",
+            )
+            max_output_tokens = next_token_budget
         except retryable_errors as error:
             if attempt >= AI_REQUEST_RETRY_ATTEMPTS:
                 raise
@@ -1699,7 +1789,8 @@ class QidianFetchWorker(QThread):
                 raise ValueError(
                     "Введите ссылку вида https://www.qidian.com/book/1041604040/ "
                     "или https://fanqienovel.com/page/7229603492648717324 "
-                    "или https://www.ciweimao.com/book/100441110"
+                    "или https://www.ciweimao.com/book/100441110 "
+                    "или https://www.qimao.com/shuku/195958/"
                 )
 
             configure_playwright_runtime()
@@ -1744,6 +1835,15 @@ class QidianFetchWorker(QThread):
                         except Exception:
                             page.wait_for_timeout(2500)
                         payload = page.evaluate(_CIWEIMAO_EXTRACT_SCRIPT)
+                    elif validate_qimao_url(self.qidian_url):
+                        try:
+                            page.wait_for_selector(
+                                ".book-information .title .txt, .book-detail-info .title .txt",
+                                timeout=12000,
+                            )
+                        except Exception:
+                            page.wait_for_timeout(2500)
+                        payload = page.evaluate(_QIMAO_EXTRACT_SCRIPT)
                     else:
                         try:
                             page.wait_for_function(
@@ -2019,6 +2119,106 @@ def _fetch_fanqie_cover_context(
     return _truncate_cover_source_text("\n\n".join(chapters)), description
 
 
+def _fetch_qimao_cover_context(
+    source_url: str,
+    *,
+    visible_browser: bool = False,
+    original_description: str = "",
+    log_callback=None,
+) -> tuple[str, str]:
+    configure_playwright_runtime()
+    from playwright.sync_api import sync_playwright
+
+    def log(level: str, message: str) -> None:
+        if callable(log_callback):
+            log_callback(level, message)
+
+    description = _clean_multiline(original_description)
+    log("INFO", "Qimao: ищу первые главы для контекста обложки...")
+    chapters = []
+    with sync_playwright() as playwright:
+        browser = _launch_chromium(
+            playwright,
+            headless=not visible_browser,
+            log_callback=log,
+        )
+        page = browser.new_page(
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        )
+        try:
+            page.goto(source_url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_selector(
+                    ".book-information .title .txt, .book-detail-info .title .txt",
+                    timeout=12000,
+                )
+            except Exception:
+                page.wait_for_timeout(2500)
+
+            if not description:
+                try:
+                    payload = page.evaluate(_QIMAO_EXTRACT_SCRIPT)
+                    description = _clean_multiline(payload.get("description"))
+                    if description:
+                        log("SUCCESS", "Qimao: описание добавлено в контекст обложки.")
+                except Exception as error:
+                    log("WARNING", f"Qimao: не удалось получить описание для контекста обложки: {error}")
+
+            try:
+                links = _fetch_qimao_chapter_links(
+                    source_url,
+                    limit=QIDIAN_COVER_PROMPT_CHAPTER_COUNT,
+                )
+            except Exception as error:
+                links = []
+                log("WARNING", f"Qimao: каталог глав недоступен: {error}")
+
+            if not links:
+                log("WARNING", "Qimao: использую первую главу, встроенную в страницу книги.")
+                chapter_payload = page.evaluate(_QIMAO_CHAPTER_TEXT_SCRIPT)
+                chapter_title = _clean_text(chapter_payload.get("title")) or "Глава 1"
+                chapter_text = _clean_qidian_chapter_text(chapter_payload.get("text"))
+                if chapter_text:
+                    chapters.append(f"{chapter_title}\n{chapter_text}")
+            else:
+                for index, link in enumerate(links[:QIDIAN_COVER_PROMPT_CHAPTER_COUNT], start=1):
+                    href = link.get("href") if isinstance(link, dict) else ""
+                    if not href:
+                        continue
+                    title = _clean_text(link.get("title") if isinstance(link, dict) else "") or f"Глава {index}"
+                    log("INFO", f"Qimao: читаю {title}...")
+                    try:
+                        page.goto(href, wait_until="domcontentloaded", timeout=60000)
+                        try:
+                            page.wait_for_selector(
+                                ".chapter-detail-article .article, .chapter-detail .article",
+                                timeout=12000,
+                            )
+                        except Exception:
+                            page.wait_for_timeout(2500)
+                        chapter_payload = page.evaluate(_QIMAO_CHAPTER_TEXT_SCRIPT)
+                    except Exception as error:
+                        log("WARNING", f"Qimao: не удалось открыть главу '{title}': {error}")
+                        continue
+
+                    chapter_title = title or _clean_text(chapter_payload.get("title")) or f"Глава {index}"
+                    chapter_text = _clean_qidian_chapter_text(chapter_payload.get("text"))
+                    if not chapter_text:
+                        log("WARNING", f"Qimao: текст главы '{title}' не найден, пропускаю.")
+                        continue
+                    chapters.append(f"{chapter_title}\n{chapter_text}")
+        finally:
+            browser.close()
+
+    log("SUCCESS", f"Qimao: получено глав для контекста обложки: {len(chapters)}.")
+    return _truncate_cover_source_text("\n\n".join(chapters)), description
+
+
 def _wait_for_ciweimao_human_verification(page) -> dict:
     page.wait_for_function(
         """() => {
@@ -2179,6 +2379,13 @@ def _fetch_source_cover_context(
             original_description=original_description,
             log_callback=log_callback,
         )
+    if validate_qimao_url(source_url):
+        return _fetch_qimao_cover_context(
+            source_url,
+            visible_browser=visible_browser,
+            original_description=original_description,
+            log_callback=log_callback,
+        )
     return _fetch_qidian_cover_context(
         source_url,
         visible_browser=visible_browser,
@@ -2247,7 +2454,7 @@ class AiPrepareWorker(QThread):
             translation_response = self._run_ai_request(
                 translation_prompt,
                 log_prefix="Qidian -> Rulate translation",
-                max_output_tokens=2048,
+                max_output_tokens=8192,
             )
             self._raise_if_cancelled()
             prepared = parse_translation_metadata(translation_response)
@@ -2357,7 +2564,8 @@ class CoverPromptWorker(QThread):
                 raise ValueError(
                     "Введите ссылку вида https://www.qidian.com/book/1041604040/ "
                     "или https://fanqienovel.com/page/7229603492648717324 "
-                    "или https://www.ciweimao.com/book/100441110"
+                    "или https://www.ciweimao.com/book/100441110 "
+                    "или https://www.qimao.com/shuku/195958/"
                 )
             if not self.title_ru:
                 raise ValueError("Заполните русское название перед генерацией промпта обложки.")
@@ -2983,9 +3191,10 @@ class RulateFillWorker(QThread):
                 page = browser.pages[0] if browser.pages else browser.new_page()
                 form_opened = self._select_catalog_category(page)
                 if not form_opened:
-                    self.log("WARNING", "Rulate: форма после выбора раздела не открылась, пробую открыть общую информацию напрямую.")
-                    page.goto(RULATE_INFO_URL, timeout=60000)
-                    page.wait_for_timeout(1500)
+                    raise ValueError(
+                        "Rulate: раздел каталога не подтверждён. Создание книги остановлено, "
+                        "чтобы не оставить раздел 'Не задан'."
+                    )
 
                 if page.locator("#form-edit").count() == 0:
                     self.log(
@@ -3016,80 +3225,38 @@ class RulateFillWorker(QThread):
     def _select_catalog_category(self, page) -> bool:
         self.log("INFO", "Rulate: открываю выбор раздела каталога...")
         page.goto(RULATE_CATEGORY_URL, timeout=60000)
-        page.wait_for_timeout(1500)
-
         try:
-            page.locator(RULATE_BOOK_TYPE_SELECTOR).first.click(timeout=10000)
-        except Exception:
-            self.log("WARNING", "Rulate: не удалось автоматически выбрать тип 'Книга'. Проверьте страницу категории вручную.")
-            return False
+            # An existing creation session can already be on the category step.
+            book_type = page.locator(RULATE_BOOK_TYPE_SELECTOR)
+            if book_type.count():
+                book_type.first.click(timeout=10000)
 
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception:
-            pass
-        page.wait_for_timeout(1200)
-        self.log("SUCCESS", "Rulate: тип 'Книга' выбран.")
+            translation = page.locator('input[name="copyright"][value="0"]')
+            if translation.count():
+                translation.check(timeout=10000)
+                page.locator('form[action="/book/0/edit/pubtype"]').get_by_role(
+                    "button", name="Продолжить", exact=True,
+                ).click(timeout=10000)
+                self.log("INFO", "Rulate: выбран тип публикации 'Перевод'.")
 
-        selected = page.evaluate(
-            """(categoryTitle) => {
-                const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim();
-                const clickCandidate = (selector) => {
-                    const candidates = Array.from(document.querySelectorAll(selector));
-                    for (const candidate of candidates) {
-                        if (candidate.tagName === "A") {
-                            const href = candidate.getAttribute("href") || "";
-                            if (href && href !== "#" && !href.includes("/book/0/edit/cat")) {
-                                continue;
-                            }
-                        }
-                        if (normalize(candidate.textContent) === categoryTitle) {
-                            candidate.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                };
-                if (clickCandidate("a, button, label")) return true;
-
-                const inputs = Array.from(document.querySelectorAll("input[type=radio], input[type=checkbox]"));
-                for (const input of inputs) {
-                    const id = input.getAttribute("id");
-                    const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
-                    const parentText = normalize(input.closest("label, li, div")?.textContent);
-                    if (normalize(label?.textContent) === categoryTitle || parentText === categoryTitle) {
-                        input.checked = true;
-                        input.dispatchEvent(new Event("input", {bubbles: true}));
-                        input.dispatchEvent(new Event("change", {bubbles: true}));
-                        input.click();
-                        return true;
-                    }
-                }
-                return false;
-            }""",
-            RULATE_CHINESE_CATEGORY_TITLE,
-        )
-        if not selected:
-            self.log("WARNING", "Rulate: не удалось автоматически выбрать раздел 'Китайские'. Проверьте страницу категории вручную.")
-            return False
-
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception:
-            pass
-        try:
+            page.get_by_role("link", name=RULATE_CHINESE_CATEGORY_TITLE, exact=True).click(timeout=10000)
             page.locator("#form-edit").wait_for(state="attached", timeout=20000)
-        except Exception:
-            self.log("WARNING", "Rulate: раздел 'Китайские' выбран, но форма редактирования пока не найдена.")
+            if not _rulate_catalog_matches(page, RULATE_CHINESE_CATEGORY_TITLE):
+                self.log("WARNING", "Rulate: форма открылась, но раздел 'Китайские' не установлен.")
+                return False
+        except Exception as error:
+            self.log("WARNING", f"Rulate: не удалось выбрать раздел каталога 'Китайские': {error}")
             return False
 
-        self.log("SUCCESS", "Rulate: раздел каталога 'Китайские' выбран, форма открыта.")
+        self.log("SUCCESS", "Rulate: раздел каталога 'Китайские' подтверждён в форме книги.")
         return True
 
     def _fill_general(self, page) -> None:
         qidian = self.draft.qidian
         prepared = self.draft.prepared
         _show_rulate_tab(page, "general")
+        if not _rulate_catalog_matches(page, RULATE_CHINESE_CATEGORY_TITLE):
+            raise ValueError("Rulate: раздел каталога в форме книги не соответствует разделу 'Китайские'.")
         page.select_option("#Book_s_lang", "7")
         page.select_option("#Book_t_lang", "1")
         _fill(page, "#Book_s_title", prepared.english_title)
@@ -3156,6 +3323,9 @@ class RulateFillWorker(QThread):
         )
         for selector, value, label in values:
             try:
+                if not _rulate_setting_is_editable(page, selector):
+                    self.log("INFO", f"Rulate: ссылка {label} недоступна в форме книги; используются настройки аккаунта.")
+                    continue
                 _fill(page, selector, value)
                 self.log("SUCCESS", f"Rulate: заполнена ссылка {label}.")
             except Exception as error:
@@ -3165,19 +3335,45 @@ class RulateFillWorker(QThread):
         unsub_hour = random.randint(0, 23)
         unsub_minute = random.randint(0, 59)
         publication_hour = random.randint(0, 23)
+        fields = (
+            ('[name="Book[unsub_count]"]', "fill", "1"),
+            ('[name="Book[unsub_days]"]', "fill", "3"),
+            ('[name="Book[unsub_hours]"]', "select", str(unsub_hour)),
+            ('[name="Book[unsub_minutes]"]', "select", str(unsub_minute)),
+            ('[name="Book[unsub_limit]"]', "fill", "-1"),
+            ('[name="Book[unsub_auto]"][type="checkbox"]', "check", None),
+            ('[name="Book[open_count]"]', "fill", "10"),
+            ('[name="Book[open_days]"]', "fill", "1"),
+            ('[name="Book[open_hours]"]', "fill", str(publication_hour)),
+            ('[name="Book[open_auto]"][type="checkbox"]', "check", None),
+            ('[name="Book[frequency]"][type="checkbox"]', "check", None),
+        )
         try:
-            _fill(page, '[name="Book[unsub_count]"]', "1")
-            _fill(page, '[name="Book[unsub_days]"]', "3")
-            page.select_option('[name="Book[unsub_hours]"]', str(unsub_hour))
-            page.select_option('[name="Book[unsub_minutes]"]', str(unsub_minute))
-            _fill(page, '[name="Book[unsub_limit]"]', "-1")
-            page.locator('[name="Book[unsub_auto]"][type="checkbox"]').check()
-
-            _fill(page, '[name="Book[open_count]"]', "10")
-            _fill(page, '[name="Book[open_days]"]', "1")
-            _fill(page, '[name="Book[open_hours]"]', str(publication_hour))
-            page.locator('[name="Book[open_auto]"][type="checkbox"]').check()
-            page.locator('[name="Book[frequency]"][type="checkbox"]').check()
+            for group in ("unsub", "post_open", "display"):
+                individual = page.locator(
+                    f'input[name="book_settings_mode[{group}]"][value="individual"]'
+                )
+                # Older forms have no inheritance switch.
+                if individual.count():
+                    individual.check(timeout=5000)
+                    if not individual.is_checked():
+                        raise ValueError(f"Не включён режим 'Только для этой книги': {group}")
+            # Check the entire schedule before changing anything: a partial schedule
+            # could combine account defaults with unrelated random publication times.
+            if not all(_rulate_setting_is_editable(page, selector) for selector, _, _ in fields):
+                self.log(
+                    "WARNING",
+                    "Rulate: расписание недоступно для полного редактирования в форме книги; "
+                    "проверьте переключатели 'Только для этой книги' и заполните расписание вручную.",
+                )
+                return
+            for selector, action, value in fields:
+                if action == "fill":
+                    _fill(page, selector, value)
+                elif action == "select":
+                    page.select_option(selector, value)
+                else:
+                    page.locator(selector).check()
         except Exception as error:
             self.log("WARNING", f"Rulate: не удалось заполнить расписание публикации: {error}")
             return
@@ -3343,6 +3539,33 @@ class _SingleRequestWorker:
 
     def get_debug_operation_context(self) -> dict:
         return {"feature": "qidian_rulate"}
+
+
+def _rulate_catalog_matches(page, title: str) -> bool:
+    """Verify the read-only catalogue row populated by Rulate's creation wizard."""
+    return bool(page.evaluate(
+        r"""(title) => {
+            const normalize = value => (value || "").replace(/\s+/g, " ").trim();
+            const label = Array.from(document.querySelectorAll("#general label")).find(
+                label => normalize(label.textContent) === "Раздел каталога"
+            );
+            const controls = label?.closest(".control-group")?.querySelector(".controls");
+            if (!controls) return false;
+            const text = Array.from(controls.childNodes)
+                .filter(node => node.nodeType === Node.TEXT_NODE)
+                .map(node => node.textContent).join(" ");
+            return normalize(text.split("←")[0]) === title;
+        }""",
+        title,
+    ))
+
+
+def _rulate_setting_is_editable(page, selector: str) -> bool:
+    """Account-managed settings may be absent, hidden, disabled or read-only."""
+    field = page.locator(selector)
+    if field.count() != 1 or not field.is_visible():
+        return False
+    return field.is_enabled() and field.get_attribute("readonly") is None
 
 
 def _fill(page, selector: str, value: str) -> None:
@@ -4196,6 +4419,79 @@ _CIWEIMAO_CHAPTER_TEXT_SCRIPT = r"""() => {
         if (value.length > 200) return {title, text: value, blocked};
     }
     return {title, text: "", blocked};
+}"""
+
+
+_QIMAO_EXTRACT_SCRIPT = r"""() => {
+    const text = (node) => (node && node.textContent ? node.textContent.replace(/\s+/g, " ").trim() : "");
+    const attr = (selector, name) => {
+        const node = document.querySelector(selector);
+        return node ? (node.getAttribute(name) || "").trim() : "";
+    };
+    const firstText = (selectors) => {
+        for (const selector of selectors) {
+            const value = text(document.querySelector(selector));
+            if (value) return value;
+        }
+        return "";
+    };
+    const firstAttr = (selectors, name) => {
+        for (const selector of selectors) {
+            const value = attr(selector, name);
+            if (value) return value;
+        }
+        return "";
+    };
+    const metaDescription = attr('meta[name="description"]', "content");
+    const descriptionMarker = metaDescription.lastIndexOf("简介：");
+    const descriptionFromMeta = descriptionMarker >= 0
+        ? metaDescription.slice(descriptionMarker + 3).trim()
+        : "";
+    return {
+        title: firstText([
+            ".book-information .title .txt",
+            ".book-detail-info .title .txt",
+            ".book-information h1",
+            "h1",
+        ]),
+        author: firstText([
+            '.book-information .sub-title a[href*="/zuozhe/"]',
+            '.book-detail-info a[href*="/zuozhe/"]',
+        ]).replace(/^作者[:：]\s*/, ""),
+        description: firstText([
+            ".book-introduction-item .intro",
+            ".book-introduction .intro",
+        ]) || descriptionFromMeta,
+        cover_url: firstAttr([
+            ".book-information .wrap-pic img",
+            ".book-detail-info .wrap-pic img",
+        ], "src"),
+        body_text: "",
+        meta_description: metaDescription,
+    };
+}"""
+
+
+_QIMAO_CHAPTER_TEXT_SCRIPT = r"""() => {
+    const text = (node) => node ? (node.innerText || node.textContent || "").replace(/\r/g, "").trim() : "";
+    const article =
+        document.querySelector(".chapter-detail-article .article") ||
+        document.querySelector(".chapter-detail .article") ||
+        document.querySelector(".book-introduction-item .article");
+    const embeddedContainer = article && article.closest(".book-introduction-item");
+    const title =
+        text(document.querySelector(".chapter-title")) ||
+        text(embeddedContainer && embeddedContainer.querySelector(".qm-with-title-th")) ||
+        text(document.querySelector("h2")) ||
+        (document.title || "").split("-")[0].trim();
+    const paragraphs = article
+        ? Array.from(article.querySelectorAll("p")).map(node => text(node)).filter(Boolean)
+        : [];
+    if (paragraphs.length) {
+        return {title, text: paragraphs.join("\n")};
+    }
+    const articleText = text(article);
+    return {title, text: articleText.length > 200 ? articleText : ""};
 }"""
 
 

@@ -1,6 +1,8 @@
 import json
 from threading import Event
 
+import pytest
+
 from PyQt6.QtGui import QImage
 
 from qidian_rulate.models import QidianBookMetadata
@@ -18,6 +20,7 @@ from qidian_rulate.workers import (
     _load_cover_image_from_data,
     _load_cover_image_from_file,
     _cover_url_candidates,
+    _fetch_qimao_chapter_links,
     _is_browser_missing_error,
     _clean_ciweimao_chapter_text,
     _clean_qidian_description,
@@ -31,6 +34,9 @@ from qidian_rulate.workers import (
     _FANQIE_EXTRACT_SCRIPT,
     _fanqie_book_id,
     _find_tomato_executable,
+    _qimao_book_id,
+    _QIMAO_CHAPTER_TEXT_SCRIPT,
+    _QIMAO_EXTRACT_SCRIPT,
     _QIDIAN_CHAPTER_LINKS_SCRIPT,
     _read_tomato_chapters_from_folder,
     _select_qidian_description,
@@ -58,6 +64,7 @@ from qidian_rulate.workers import (
     parse_translation_metadata,
     validate_ciweimao_url,
     validate_fanqie_url,
+    validate_qimao_url,
     validate_qidian_url,
     validate_source_url,
 )
@@ -143,6 +150,18 @@ class _CheckedField:
     def check(self):
         self.checked.append(self.selector)
 
+    def count(self):
+        return 1
+
+    def is_visible(self):
+        return True
+
+    def is_enabled(self):
+        return True
+
+    def get_attribute(self, name):
+        return None
+
 
 class _SchedulePage:
     def __init__(self):
@@ -153,6 +172,8 @@ class _SchedulePage:
         self.selected.append((selector, value))
 
     def locator(self, selector):
+        if "book_settings_mode" in selector:
+            return _EmptyLocator()
         return _CheckedField(selector, self.checked)
 
 
@@ -260,7 +281,7 @@ def test_validate_qidian_url_accepts_book_links_only():
     assert not validate_qidian_url("https://example.com/book/1041604040/")
 
 
-def test_validate_source_url_accepts_fanqie_and_ciweimao_book_links():
+def test_validate_source_url_accepts_supported_book_links():
     assert validate_fanqie_url("https://fanqienovel.com/page/7229603492648717324")
     assert validate_fanqie_url("https://www.fanqienovel.com/page/7229603492648717324?enter_from=search")
     assert not validate_fanqie_url("https://fanqienovel.com/reader/7233607619578233396")
@@ -277,6 +298,55 @@ def test_validate_source_url_accepts_fanqie_and_ciweimao_book_links():
     assert not validate_ciweimao_url("https://example.com/book/100441110")
     assert validate_source_url("https://www.ciweimao.com/book/100441110")
     assert _source_name("https://www.ciweimao.com/book/100441110") == "Ciweimao"
+
+    assert validate_qimao_url("https://www.qimao.com/shuku/195958/")
+    assert validate_qimao_url("http://qimao.com/shuku/195958?source=search")
+    assert not validate_qimao_url("https://www.qimao.com/shuku/195958-499610/")
+    assert not validate_qimao_url("https://example.com/shuku/195958/")
+    assert validate_source_url("https://www.qimao.com/shuku/195958/")
+    assert _qimao_book_id("https://www.qimao.com/shuku/195958/") == "195958"
+    assert _source_name("https://www.qimao.com/shuku/195958/") == "Qimao"
+
+
+def test_fetch_qimao_chapter_links_uses_public_catalog_api(monkeypatch):
+    calls = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": {
+                    "chapters": [
+                        {"id": "499610", "title": "第1章  红杏出墙"},
+                        {"id": "520725", "title": "第2章  漂亮的女上司"},
+                        {"id": "invalid", "title": "skip"},
+                    ]
+                }
+            }
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr(workers.requests, "get", fake_get)
+
+    links = _fetch_qimao_chapter_links("https://www.qimao.com/shuku/195958/", limit=2)
+
+    assert links == [
+        {
+            "href": "https://www.qimao.com/shuku/195958-499610/",
+            "title": "第1章 红杏出墙",
+        },
+        {
+            "href": "https://www.qimao.com/shuku/195958-520725/",
+            "title": "第2章 漂亮的女上司",
+        },
+    ]
+    assert calls[0][0] == "https://www.qimao.com/api/book/chapter-list"
+    assert calls[0][1]["params"] == {"book_id": "195958"}
+    assert calls[0][1]["headers"]["Referer"] == "https://www.qimao.com/shuku/195958/"
 
 
 def test_single_request_worker_reads_external_cancel_event():
@@ -353,6 +423,76 @@ def test_rulate_fill_uses_category_page_before_info_page():
     assert RULATE_BOOK_TYPE_SELECTOR == 'a.create-card.card-book[href*="typ=A"]'
     assert RULATE_CHINESE_CATEGORY_TITLE == "Китайские"
     assert RULATE_INFO_URL == "https://tl.rulate.ru/book/0/edit/info#general"
+
+
+@pytest.mark.parametrize("start", ["type", "pubtype", "cat"])
+def test_rulate_creation_walks_publication_step_before_category(monkeypatch, start):
+    class Page:
+        def __init__(self):
+            self.stage = start
+            self.calls = []
+            self.translation = False
+
+        def goto(self, url, **kwargs):
+            assert url == RULATE_CATEGORY_URL
+
+        def locator(self, selector):
+            return Locator(self, selector)
+
+        def get_by_role(self, role, *, name, exact):
+            assert self.stage == "cat"
+            assert role == "link" and name == "Китайские" and exact
+            return Locator(self, "category")
+
+    class Locator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+
+        @property
+        def first(self):
+            return self
+
+        def count(self):
+            if self.selector == RULATE_BOOK_TYPE_SELECTOR:
+                return int(self.page.stage == "type")
+            assert self.selector == 'input[name="copyright"][value="0"]'
+            return int(self.page.stage == "pubtype")
+
+        def check(self, **kwargs):
+            self.page.translation = True
+            self.page.calls.append("translation")
+
+        def get_by_role(self, role, *, name, exact):
+            assert self.selector == 'form[action="/book/0/edit/pubtype"]'
+            assert role == "button" and name == "Продолжить" and exact
+            return Locator(self.page, "continue")
+
+        def click(self, **kwargs):
+            if self.selector == RULATE_BOOK_TYPE_SELECTOR:
+                self.page.stage = "pubtype"
+            elif self.selector == "continue":
+                assert self.page.translation
+                self.page.stage = "cat"
+            else:
+                assert self.selector == "category" and self.page.stage == "cat"
+                self.page.stage = "info"
+            self.page.calls.append(self.selector)
+
+        def wait_for(self, **kwargs):
+            assert self.selector == "#form-edit" and self.page.stage == "info"
+
+    page = Page()
+    harness = _SocialLinksHarness()
+    monkeypatch.setattr(workers, "_rulate_catalog_matches", lambda page, title: page.stage == "info")
+    assert RulateFillWorker._select_catalog_category(harness, page)
+    assert page.calls[-1] == "category"
+    if start != "cat":
+        assert page.calls.index("translation") < page.calls.index("continue") < page.calls.index("category")
+
+    monkeypatch.setattr(workers, "_rulate_catalog_matches", lambda *args: False)
+    page = Page()
+    assert not RulateFillWorker._select_catalog_category(harness, page)
 
 
 def test_qidian_creator_return_to_menu_closes_before_handler():
@@ -492,7 +632,7 @@ def test_social_links_use_defaults_for_legacy_draft(monkeypatch):
     monkeypatch.setattr(workers, "_fill", lambda _page, selector, value: filled.append((selector, value)))
 
     harness = _SocialLinksHarness()
-    harness._fill_social_links(object())
+    harness._fill_social_links(_SchedulePage())
 
     assert filled == [
         ('[name="Book[vk_link]"]', "https://vk.com/tldnd"),
@@ -527,6 +667,91 @@ def test_publication_schedule_uses_requested_counts_and_random_times(monkeypatch
         '[name="Book[open_auto]"][type="checkbox"]',
         '[name="Book[frequency]"][type="checkbox"]',
     ]
+
+
+@pytest.mark.parametrize("state", ["missing", "hidden", "disabled", "readonly"])
+def test_account_managed_rulate_fields_are_skipped_without_writes(monkeypatch, state):
+    class AccountField(_CheckedField):
+        def count(self):
+            return 0 if state == "missing" else 1
+
+        def is_visible(self):
+            return state != "hidden"
+
+        def is_enabled(self):
+            return state != "disabled"
+
+        def get_attribute(self, name):
+            return "" if state == "readonly" and name == "readonly" else None
+
+    page = _SchedulePage()
+    page.locator = lambda selector: (
+        _EmptyLocator() if "book_settings_mode" in selector else AccountField(selector, page.checked)
+    )
+    filled = []
+    monkeypatch.setattr(workers, "_fill", lambda _page, selector, value: filled.append((selector, value)))
+    social = _SocialLinksHarness()
+    schedule = _PublicationScheduleHarness()
+
+    social._fill_social_links(page)
+    schedule._fill_publication_schedule(page)
+
+    assert not filled
+    assert not page.selected
+    assert not page.checked
+    assert social.logs and schedule.logs
+    assert all(level == "INFO" for level, _ in social.logs)
+    assert schedule.logs[0][0] == "WARNING"
+
+
+def test_partially_locked_schedule_is_not_partially_overwritten(monkeypatch):
+    page = _SchedulePage()
+    original_locator = page.locator
+    page.locator = lambda selector: (
+        _EmptyLocator() if "frequency" in selector else original_locator(selector)
+    )
+    filled = []
+    monkeypatch.setattr(workers, "_fill", lambda *args: filled.append(args))
+
+    _PublicationScheduleHarness()._fill_publication_schedule(page)
+
+    assert not filled
+    assert not page.selected
+    assert not page.checked
+
+
+@pytest.mark.parametrize("switch_works", [True, False])
+def test_schedule_enables_individual_settings_before_filling(monkeypatch, switch_works):
+    enabled = set()
+    filled = []
+
+    class Switch(_CheckedField):
+        def check(self, **kwargs):
+            if switch_works:
+                enabled.add(self.selector)
+
+        def is_checked(self):
+            return self.selector in enabled
+
+    class Page(_SchedulePage):
+        def locator(self, selector):
+            if "book_settings_mode" in selector:
+                return Switch(selector, self.checked)
+            assert len(enabled) == 3
+            return super().locator(selector)
+
+    def fill(page, selector, value):
+        assert len(enabled) == 3
+        filled.append((selector, value))
+
+    monkeypatch.setattr(workers, "_fill", fill)
+    page = Page()
+    harness = _PublicationScheduleHarness()
+    harness._fill_publication_schedule(page)
+
+    assert bool(filled) is switch_works
+    assert bool(page.checked) is switch_works
+    assert harness.logs[-1][0] == ("SUCCESS" if switch_works else "WARNING")
 
 
 def test_parse_translation_metadata_repairs_unescaped_quotes_in_string():
@@ -812,6 +1037,43 @@ def test_ciweimao_scripts_use_public_book_metadata_and_chapter_links():
     assert "#J_book_chapter_list" in _CIWEIMAO_CHAPTER_LINKS_SCRIPT
     assert "/chapter/" in _CIWEIMAO_CHAPTER_LINKS_SCRIPT
     assert "验证码" in _CIWEIMAO_CHAPTER_TEXT_SCRIPT
+
+
+def test_qimao_scripts_use_book_metadata_and_public_chapter_dom():
+    assert ".book-information .title .txt" in _QIMAO_EXTRACT_SCRIPT
+    assert ".book-introduction-item .intro" in _QIMAO_EXTRACT_SCRIPT
+    assert ".book-information .wrap-pic img" in _QIMAO_EXTRACT_SCRIPT
+    assert ".chapter-detail-article .article" in _QIMAO_CHAPTER_TEXT_SCRIPT
+    assert ".book-introduction-item .article" in _QIMAO_CHAPTER_TEXT_SCRIPT
+
+
+def test_source_cover_context_dispatches_qimao(monkeypatch):
+    calls = []
+
+    def fake_fetch(source_url, **kwargs):
+        calls.append((source_url, kwargs))
+        return "chapters", "description"
+
+    monkeypatch.setattr(workers, "_fetch_qimao_cover_context", fake_fetch)
+
+    result = workers._fetch_source_cover_context(
+        "https://www.qimao.com/shuku/195958/",
+        visible_browser=True,
+        original_description="original",
+        log_callback="logger",
+    )
+
+    assert result == ("chapters", "description")
+    assert calls == [
+        (
+            "https://www.qimao.com/shuku/195958/",
+            {
+                "visible_browser": True,
+                "original_description": "original",
+                "log_callback": "logger",
+            },
+        )
+    ]
 
 
 def test_ciweimao_human_verification_waits_five_minutes_and_rechecks_page():

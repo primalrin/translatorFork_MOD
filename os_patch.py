@@ -122,6 +122,12 @@ class DeadlockNotifier(QtCore.QObject):
 
 _global_notifier = None
 
+# Non-isolated memfs copies are shared by every task that reads the same source
+# file.  Keep the source identity next to the cached copy so replacing an EPUB
+# at the same disk path cannot leave the task queue reading stale bytes.
+_memfs_copy_lock = threading.RLock()
+_memfs_source_signatures = {}
+
 # --- КОД ВСПОМОГАТЕЛЬНЫХ ФУНКЦИЙ ---
 def _parse_path(path):
     if isinstance(path, str) and path.startswith(VIRTUAL_PREFIX):
@@ -674,9 +680,19 @@ def _patched_sqlite3_connect(*args, **kwargs):
 
     return conn
 
-def copy_to_mem(real_path: str, *, unique: bool = False) -> str | None:
+def _real_file_signature(real_path: str):
+    stat_result = os.stat(real_path)
+    return (
+        stat_result.st_size,
+        getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000)),
+        getattr(stat_result, "st_ctime_ns", int(stat_result.st_ctime * 1_000_000_000)),
+    )
+
+
+def copy_to_mem(real_path: str, *, unique: bool = False, refresh: bool = False) -> str | None:
     # Используем _patched_exists, который теперь тоже защищен, так как использует _patched_open опосредованно
-    if not real_path or not _patched_exists(real_path): return None
+    if not real_path or not _patched_exists(real_path):
+        return None
     
     mem_fs = _get_or_create_mem_fs()
     # Нормализация пути остается важной
@@ -688,16 +704,56 @@ def copy_to_mem(real_path: str, *, unique: bool = False) -> str | None:
     virtual_path_internal_for_pyfs = "/" + normalized_path
     virtual_path_for_return = VIRTUAL_PREFIX + normalized_path
     
-    if not mem_fs.exists(virtual_path_internal_for_pyfs):
+    source_is_virtual = isinstance(real_path, str) and real_path.startswith(VIRTUAL_PREFIX)
+    signature_key = (id(mem_fs), virtual_path_internal_for_pyfs)
+
+    with _memfs_copy_lock:
+        destination_exists = mem_fs.exists(virtual_path_internal_for_pyfs)
+        source_signature = None
+        if not source_is_virtual:
+            try:
+                source_signature = _real_file_signature(real_path)
+            except OSError as e:
+                print(f"[OS_PATCH ERROR] Не удалось прочитать метаданные {real_path}: {e}")
+                return None
+
+        needs_copy = bool(refresh or not destination_exists)
+        if not unique and source_signature is not None:
+            if _memfs_source_signatures.get(signature_key) != source_signature:
+                needs_copy = True
+            elif destination_exists:
+                try:
+                    cached_size = mem_fs.getinfo(
+                        virtual_path_internal_for_pyfs,
+                        namespaces=["details"],
+                    ).size
+                    if cached_size != source_signature[0]:
+                        needs_copy = True
+                except Exception:
+                    needs_copy = True
+
+        if not needs_copy:
+            return virtual_path_for_return
+
         try:
             mem_fs.makedirs(_original["os_path"].dirname(virtual_path_internal_for_pyfs), recreate=True)
             # Теперь этот вызов _patched_open автоматически будет "терпеливым"
             with _patched_open(real_path, 'rb') as f_real:
-                mem_fs.writebytes(virtual_path_internal_for_pyfs, f_real.read())
+                source_bytes = f_real.read()
+            mem_fs.writebytes(virtual_path_internal_for_pyfs, source_bytes)
+            if not unique and source_signature is not None:
+                # Re-read the signature after the copy.  If an external writer
+                # changed the source during the read, the next call will detect
+                # the mismatch and refresh again instead of blessing stale data.
+                final_signature = _real_file_signature(real_path)
+                if final_signature == source_signature:
+                    _memfs_source_signatures[signature_key] = final_signature
+                else:
+                    _memfs_source_signatures.pop(signature_key, None)
         except Exception as e:
             print(f"[OS_PATCH ERROR] Не удалось скопировать {real_path} в memfs: {e}")
             return None
-            
+
     return virtual_path_for_return
 
 def write_bytes_to_mem(data: bytes, extension: str = ".bin") -> str | None:

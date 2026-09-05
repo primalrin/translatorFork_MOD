@@ -1,4 +1,5 @@
 import os
+import zipfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -34,6 +35,9 @@ class _TaskManager:
 
 class _SetupHarness:
     on_file_selected = InitialSetupDialog.on_file_selected
+    _collect_previous_translated_chapter_titles = (
+        InitialSetupDialog._collect_previous_translated_chapter_titles
+    )
 
     def __init__(self, selected_file=None, output_folder=None, html_files=None):
         self.selected_file = selected_file
@@ -47,8 +51,20 @@ class _SetupHarness:
         self.initialization_calls = 0
         self.ready_checks = 0
 
-    def _process_selected_file(self, pre_selected_chapters=None):
-        self.process_calls.append(pre_selected_chapters)
+    def _read_epub_chapter_titles(self, epub_path, chapter_paths):
+        return InitialSetupDialog._read_epub_chapter_titles(
+            epub_path,
+            chapter_paths,
+        )
+
+    def _process_selected_file(
+        self,
+        pre_selected_chapters=None,
+        previous_translated_chapter_titles=None,
+    ):
+        self.process_calls.append(
+            (pre_selected_chapters, previous_translated_chapter_titles)
+        )
 
     def _handle_project_initialization(self):
         self.initialization_calls += 1
@@ -189,6 +205,60 @@ def test_switching_project_source_opens_chapter_selection_before_initialization(
     assert harness._pending_old_project_cleanup_offer is True
     assert len(harness.process_calls) == 1
     assert harness.initialization_calls == 0
+
+
+def test_switching_source_passes_titles_of_previous_translated_batch(tmp_path):
+    project_folder = tmp_path / "project"
+    project_folder.mkdir()
+    old_file = tmp_path / "old.epub"
+    new_file = tmp_path / "new.epub"
+    chapters = ["OEBPS/chapter_1.xhtml", "OEBPS/chapter_2.xhtml"]
+
+    with zipfile.ZipFile(old_file, "w") as archive:
+        archive.writestr(chapters[0], "<html><body><h1>Глава 99</h1></body></html>")
+        archive.writestr(chapters[1], "<html><body><h1>Глава 100</h1></body></html>")
+    with zipfile.ZipFile(new_file, "w") as archive:
+        archive.writestr("OEBPS/chapter_1.xhtml", "<html><body><h1>Глава 100</h1></body></html>")
+
+    class _ProjectManager:
+        def get_full_map(self):
+            return {
+                chapters[1]: {
+                    "_translated_gemini.html": "translated/chapter_2.html",
+                }
+            }
+
+    harness = _SetupHarness(
+        selected_file=str(old_file),
+        output_folder=str(project_folder),
+        html_files=chapters,
+    )
+    harness.project_manager = _ProjectManager()
+
+    harness.on_file_selected(str(new_file))
+
+    assert harness.process_calls == [(None, ["Глава 100"])]
+
+
+def test_swap_selection_skips_repeated_titles_from_previous_batch(tmp_path):
+    new_file = tmp_path / "new.epub"
+    chapters = [
+        "OEBPS/chapter_1.xhtml",
+        "OEBPS/chapter_2.xhtml",
+        "OEBPS/chapter_3.xhtml",
+    ]
+    with zipfile.ZipFile(new_file, "w") as archive:
+        archive.writestr(chapters[0], "<html><body><h1>Глава 99</h1></body></html>")
+        archive.writestr(chapters[1], "<html><body><h1>Глава 100</h1></body></html>")
+        archive.writestr(chapters[2], "<html><body><h1>Глава 101</h1></body></html>")
+
+    selected = InitialSetupDialog._chapters_after_previous_translated_titles(
+        str(new_file),
+        chapters,
+        ["Глава 98", "Глава 99", "Глава 100"],
+    )
+
+    assert selected == [chapters[2]]
 
 
 def test_reselecting_same_file_with_existing_chapters_keeps_initialization_path(tmp_path):
